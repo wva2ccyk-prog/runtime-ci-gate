@@ -1,0 +1,192 @@
+name: Sealed Private Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact private commit SHA to validate
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Validate sealed target
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Run sealed validation
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
+          TARGET_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
+          TARGET_SHA: ${{ inputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          # Register both secret-derived values for masking before any command
+          # that could accidentally mention them.
+          printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
+          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+
+          if [[ -z "$TARGET_REPOSITORY" || -z "$TARGET_TOKEN" ]]; then
+            echo "validation_status=configuration_error"
+            exit 1
+          fi
+          if [[ ! "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "validation_status=configuration_error"
+            exit 1
+          fi
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "validation_status=invalid_sha"
+            exit 1
+          fi
+
+          ROOT="$(mktemp -d)"
+          SRC="$ROOT/source"
+          PRIVATE_LOG="$ROOT/private.log"
+          JUNIT="$ROOT/results.xml"
+          ASKPASS="$ROOT/askpass.sh"
+          chmod 700 "$ROOT"
+          : > "$PRIVATE_LOG"
+          chmod 600 "$PRIVATE_LOG"
+
+          cleanup() {
+            chmod -R u+rwX "$ROOT" 2>/dev/null || true
+            rm -rf "$ROOT"
+          }
+          trap cleanup EXIT INT TERM
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$TARGET_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          # Nothing from private checkout is allowed onto the Actions log.
+          if ! git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+          if ! git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+          if ! git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+          if ! git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+
+          ACTUAL_SHA="$(git -C "$SRC" rev-parse HEAD 2>>"$PRIVATE_LOG" || true)"
+          if [[ "$ACTUAL_SHA" != "$TARGET_SHA" ]]; then
+            echo "validation_status=checkout_mismatch"
+            exit 1
+          fi
+
+          # The repository token is needed only for fetch. Remove credentials
+          # and target metadata before any private project code or build hook runs.
+          unset TARGET_TOKEN
+          unset GIT_ASKPASS
+          rm -f "$ASKPASS"
+          git -C "$SRC" remote remove origin >>"$PRIVATE_LOG" 2>&1 || true
+          unset TARGET_REPOSITORY
+          unset TARGET_SHA
+
+          # Prevent private project processes from writing to Actions environment,
+          # output, summary, artifact, cache, or OIDC channels.
+          SEALED_ENV=(
+            env
+            -u GITHUB_ENV
+            -u GITHUB_OUTPUT
+            -u GITHUB_PATH
+            -u GITHUB_STEP_SUMMARY
+            -u GITHUB_TOKEN
+            -u ACTIONS_RUNTIME_TOKEN
+            -u ACTIONS_RUNTIME_URL
+            -u ACTIONS_CACHE_URL
+            -u ACTIONS_RESULTS_URL
+            -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            -u ACTIONS_ID_TOKEN_REQUEST_URL
+          )
+
+          cd "$SRC"
+
+          # Suppress all setup output as well: dependency/build failures can
+          # contain paths, source snippets, metadata, or exception text.
+          if ! "${SEALED_ENV[@]}" \
+              python -m pip install --disable-pip-version-check --no-input ".[dev]" \
+              >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=setup_failed"
+            exit 1
+          fi
+          if ! "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=setup_failed"
+            exit 1
+          fi
+
+          # Capture pytest stdout/stderr completely. JUnit remains local and is
+          # parsed only for numeric counters; failure names/bodies are never printed.
+          set +e
+          "${SEALED_ENV[@]}" \
+            python -m pytest -q --tb=no --disable-warnings --timeout=60 \
+            --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
+          TEST_RC=$?
+          set -e
+
+          COUNTS="$(JUNIT_PATH="$JUNIT" python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          path = os.environ["JUNIT_PATH"]
+          try:
+              root = ET.parse(path).getroot()
+              if root.tag == "testsuite":
+                  suites = [root]
+              else:
+                  suites = list(root.findall("testsuite"))
+              def total(name):
+                  return sum(int(s.attrib.get(name, "0")) for s in suites)
+              print(
+                  f"tests={total('tests')} "
+                  f"failures={total('failures')} "
+                  f"errors={total('errors')} "
+                  f"skipped={total('skipped')}"
+              )
+          except Exception:
+              print("tests=unknown failures=unknown errors=unknown skipped=unknown")
+          PY
+          )"
+
+          # Destroy the private checkout, raw log, and JUnit before publishing
+          # the numeric result. No artifact or cache action is used.
+          cd "$HOME"
+          cleanup
+          trap - EXIT INT TERM
+
+          echo "$COUNTS"
+          if [[ "$TEST_RC" -eq 0 ]]; then
+            echo "validation_status=passed"
+            exit 0
+          fi
+
+          echo "validation_status=failed"
+          exit 1
