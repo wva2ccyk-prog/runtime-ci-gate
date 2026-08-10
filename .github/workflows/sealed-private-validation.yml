@@ -37,7 +37,6 @@ jobs:
           JUNIT="$ROOT/results.xml"
           ASKPASS="$ROOT/askpass.sh"
           CERT="$ROOT/cert.pem"
-          PLAIN="$ROOT/diagnostic.json"
           SEALED="$ROOT/diagnostic.der"
           cleanup() {
             chmod -R u+rwX "$ROOT" 2>/dev/null || true
@@ -90,28 +89,6 @@ jobs:
           TEST_RC=$?
           set -e
 
-          JUNIT_PATH="$JUNIT" python - <<'PY' > "$PLAIN"
-          import json
-          import os
-          import xml.etree.ElementTree as ET
-
-          result = {"failures": []}
-          root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
-          for case in root.iter("testcase"):
-              bad = case.find("failure") or case.find("error")
-              if bad is None:
-                  continue
-              result["failures"].append({
-                  "name": case.attrib.get("name", ""),
-                  "classname": case.attrib.get("classname", ""),
-                  "file": case.attrib.get("file", ""),
-                  "line": case.attrib.get("line", ""),
-                  "message": bad.attrib.get("message", ""),
-                  "detail": (bad.text or "")[-12000:],
-              })
-          print(json.dumps(result, ensure_ascii=False))
-          PY
-
           cat > "$CERT" <<'EOF'
           -----BEGIN CERTIFICATE-----
           MIIEGTCCAoGgAwIBAgIUBX0nn03jhUJaoEJMXR1EXQhP0TEwDQYJKoZIhvcNAQEL
@@ -140,6 +117,6 @@ jobs:
           EOF
 
           openssl cms -encrypt -aes-256-cbc -binary -outform DER \
-            -in "$PLAIN" -out "$SEALED" "$CERT"
+            -in "$JUNIT" -out "$SEALED" "$CERT"
           echo "sealed_diagnostic=$(base64 -w0 "$SEALED")"
           echo "targeted_test_status=$TEST_RC"
