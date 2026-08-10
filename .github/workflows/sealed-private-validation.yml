@@ -5,11 +5,8 @@ on:
     inputs:
       sha:
         description: Exact private commit SHA to validate
-        required: false
+        required: true
         type: string
-  push:
-    branches:
-      - main
 
 permissions: {}
 
@@ -30,7 +27,7 @@ jobs:
         env:
           TARGET_REPOSITORY: wva2ccyk-prog/ai-chef-runtime
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: ${{ inputs.sha || '9cfd6a81922e934a4c7aa7be006550c917782ee5' }}
+          TARGET_SHA: ${{ inputs.sha }}
         run: |
           set -Eeuo pipefail
           umask 077
