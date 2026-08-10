@@ -1,6 +1,12 @@
-name: Sealed Private Diagnostic
+name: Sealed Private Validation
 
 on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact private commit SHA to validate
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -8,37 +14,40 @@ on:
 permissions: {}
 
 jobs:
-  diagnose:
-    name: Diagnose sealed failures
+  validate:
+    name: Validate sealed target
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+
     steps:
       - name: Set up Python
         uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: "3.11"
 
-      - name: Run encrypted diagnostic
+      - name: Run sealed validation
         shell: bash
         env:
           TARGET_REPOSITORY: wva2ccyk-prog/ai-chef-runtime
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: 05bd68103ca34d1ce0eaf062e874a53602483614
+          TARGET_SHA: ${{ inputs.sha || '9cfd6a81922e934a4c7aa7be006550c917782ee5' }}
         run: |
           set -Eeuo pipefail
           umask 077
+
           printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
           printf '::add-mask::%s\n' "$TARGET_TOKEN"
-          [[ -n "$TARGET_TOKEN" ]]
+
+          if [[ -z "$TARGET_TOKEN" || ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "validation_status=configuration_error"
+            exit 1
+          fi
 
           ROOT="$(mktemp -d)"
           SRC="$ROOT/source"
-          LOG="$ROOT/private.log"
+          PRIVATE_LOG="$ROOT/private.log"
           JUNIT="$ROOT/results.xml"
           ASKPASS="$ROOT/askpass.sh"
-          CERT="$ROOT/cert.pem"
-          PLAIN="$ROOT/diagnostic.json"
-          SEALED="$ROOT/diagnostic.der"
           cleanup() {
             chmod -R u+rwX "$ROOT" 2>/dev/null || true
             rm -rf "$ROOT"
@@ -57,90 +66,109 @@ jobs:
           export GIT_ASKPASS="$ASKPASS"
           export GIT_TERMINAL_PROMPT=0
 
-          git init -q "$SRC" >>"$LOG" 2>&1
-          git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$LOG" 2>&1
-          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$LOG" 2>&1
-          git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$LOG" 2>&1
-          [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
+          if ! git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+          if ! git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+          if ! git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
+          if ! git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=checkout_failed"
+            exit 1
+          fi
 
-          mapfile -t FILES < <(find "$SRC/tests" -type f -name 'test_*.py' -printf '%P\n' | sort)
-          TARGETS=()
-          for RANK in 137 141; do
-            INDEX=$((RANK - 1))
-            [[ "$INDEX" -ge 0 && "$INDEX" -lt "${#FILES[@]}" ]]
-            TARGETS+=("tests/${FILES[$INDEX]}")
-          done
+          ACTUAL_SHA="$(git -C "$SRC" rev-parse HEAD 2>>"$PRIVATE_LOG" || true)"
+          if [[ "$ACTUAL_SHA" != "$TARGET_SHA" ]]; then
+            echo "validation_status=checkout_mismatch"
+            exit 1
+          fi
 
           unset TARGET_TOKEN GIT_ASKPASS TARGET_REPOSITORY TARGET_SHA
           rm -f "$ASKPASS"
-          git -C "$SRC" remote remove origin >>"$LOG" 2>&1 || true
+          git -C "$SRC" remote remove origin >>"$PRIVATE_LOG" 2>&1 || true
+
+          SEALED_ENV=(
+            env
+            -u GITHUB_ENV
+            -u GITHUB_OUTPUT
+            -u GITHUB_PATH
+            -u GITHUB_STEP_SUMMARY
+            -u GITHUB_TOKEN
+            -u ACTIONS_RUNTIME_TOKEN
+            -u ACTIONS_RUNTIME_URL
+            -u ACTIONS_CACHE_URL
+            -u ACTIONS_RESULTS_URL
+            -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
+            -u ACTIONS_ID_TOKEN_REQUEST_URL
+          )
 
           cd "$SRC"
-          python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$LOG" 2>&1
-          python -m pip check >>"$LOG" 2>&1
+          if ! "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=setup_failed"
+            exit 1
+          fi
+          if ! "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1; then
+            echo "validation_status=setup_failed"
+            exit 1
+          fi
 
           set +e
-          env \
-            -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STEP_SUMMARY \
-            -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL \
-            -u ACTIONS_CACHE_URL -u ACTIONS_RESULTS_URL \
-            -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
-            python -m pytest -q --tb=short --disable-warnings --timeout=60 \
-            -o junit_family=legacy --junitxml="$JUNIT" "${TARGETS[@]}" >"$LOG" 2>&1
+          "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=60 \
+            -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
           TEST_RC=$?
           set -e
 
-          JUNIT_PATH="$JUNIT" python - <<'PY' > "$PLAIN"
-          import json
+          COUNTS="$(JUNIT_PATH="$JUNIT" python - <<'PY'
           import os
           import xml.etree.ElementTree as ET
 
-          result = {"failures": []}
-          root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
-          for case in root.iter("testcase"):
-              bad = case.find("failure")
-              if bad is None:
-                  bad = case.find("error")
-              if bad is None:
-                  continue
-              result["failures"].append({
-                  "name": case.attrib.get("name", ""),
-                  "file": case.attrib.get("file", ""),
-                  "line": case.attrib.get("line", ""),
-                  "message": bad.attrib.get("message", "")[:1200],
-                  "detail": (bad.text or "")[-3000:],
-              })
-          print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+          path = os.environ["JUNIT_PATH"]
+          try:
+              root = ET.parse(path).getroot()
+              suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+              def total(name):
+                  return sum(int(s.attrib.get(name, "0")) for s in suites)
+              print(
+                  f"tests={total('tests')} "
+                  f"failures={total('failures')} "
+                  f"errors={total('errors')} "
+                  f"skipped={total('skipped')}"
+              )
+          except Exception:
+              print("tests=unknown failures=unknown errors=unknown skipped=unknown")
           PY
+          )"
+          echo "$COUNTS"
 
-          cat > "$CERT" <<'EOF'
-          -----BEGIN CERTIFICATE-----
-          MIIEGTCCAoGgAwIBAgIUBX0nn03jhUJaoEJMXR1EXQhP0TEwDQYJKoZIhvcNAQEL
-          BQAwHDEaMBgGA1UEAwwRc2VhbGVkLWRpYWdub3N0aWMwHhcNMjYwODEwMTcxOTU3
-          WhcNMjYwODExMTcxOTU3WjAcMRowGAYDVQQDDBFzZWFsZWQtZGlhZ25vc3RpYzCC
-          AaIwDQYJKoZIhvcNAQEBBQADggGPADCCAYoCggGBANB79TQbgnKtEvAmmBpXbISX
-          WnynT3EztRaO0BKCjucnl425D0nkcxXN5Qe0IqxpoGn1OgiQ+Gv3EwVEPv++CRbs
-          1nC9pMbYpr6c80tds5PRon07VwYUG1JxeH6xlXdduTPYIJMmT6YISPD//I41cIlq
-          M/5nUsS9+CY+CiWzL48cti7pMHjsxto7GBS264HMnPd210h3RABhCNw8yiXmrHvZ
-          X5nzvMBBumrUcOXqlJ6l5eBmA0VMOuq8uKSqFYHeQ6Dgf/3rjRnM3xt1HFbPyuY/
-          sieYtyalC27WTFOXMkgU4luLglXvz0vLwfNPorAuC3e6iizDj2uW+49O89q79Lhd
-          3nLy2dN6fzo9DbSyiut9F7Untx5eg/hQa+ik7PlSXM+3TGlmPqEsCbKKU5Px5wa8
-          ceTktNsyntnOMVK3XH6AZoNdwo0GFV5ZVZQqLZBdgSNvmkA0z04DVjAKxnkzKEir
-          0zNL61UZCCdzRRzDixXhVCcPsqj8Xle4TY8U8mEBUQIDAQABo1MwUTAdBgNVHQ4E
-          FgQUaucLJkQkzbQgdmmE+gL/R1Ej3WEwHwYDVR0jBBgwFoAUaucLJkQkzbQgdmmE
-          +gL/R1Ej3WEwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAYEAloj0
-          9obgVpri26JXuPCW5wg9U7KlQ/TPUg8U9bmEvTPLOwSL+4GCy/lPRCrOwWic7ZYo
-          tNhuq3TEk+M5xe7VuKOQ7o02ZJvkOnaE4F7kHT6S/FWPxR4bHhVa89RjdeO77+W2
-          +6QF98c1hPxmhlXS8PBN3zIVOp9JCvrMoLOBa/+Zo2/1BsnccTjSY+CPBMP3CTve
-          oSd4hqZsNmJke6secqJLEYIauaCLOWfPJo6Y48VEGFvtl2XUuyJ5RkeUR83Av9H1
-          8Yi2s/b/EImKOM4VT1vCZ/FP1kKpOPYRbIVGXJI4pvS4d3es2t+gn80o7NpR/Omf
-          +KGMPLi8luvbKAY5OCPRvW835KojErQAKz99NyZxKJL4BRZIqxros9aBuUyTDvuO
-          xuXhHmc/gKHn5DaTaPIqimHaGd6yUj34yIlPsf7Nf5Dy0dr9ZJ5IYgJpCHpkEA1z
-          VO9POUDSNZnSiWDj4PY7YT2TZyh9As1yGKlxYq9ScnzZOadzmfb52ajz+hcZ
-          -----END CERTIFICATE-----
-          EOF
+          if [[ "$TEST_RC" -ne 0 ]]; then
+            echo "package_build=not_run"
+            echo "validation_status=failed"
+            exit 1
+          fi
 
-          openssl cms -encrypt -aes-256-cbc -binary -outform DER \
-            -in "$PLAIN" -out "$SEALED" "$CERT"
-          echo "sealed_diagnostic=$(base64 -w0 "$SEALED")"
-          echo "targeted_test_status=$TEST_RC"
+          set +e
+          "${SEALED_ENV[@]}" python -m build >"$PRIVATE_LOG" 2>&1
+          BUILD_RC=$?
+          set -e
+          if [[ "$BUILD_RC" -ne 0 ]]; then
+            echo "package_build=failed"
+            echo "validation_status=failed"
+            exit 1
+          fi
+
+          WHEELS=(dist/*.whl)
+          SDISTS=(dist/*.tar.gz)
+          if [[ ! -e "${WHEELS[0]}" || ! -e "${SDISTS[0]}" ]]; then
+            echo "package_build=missing_artifact"
+            echo "validation_status=failed"
+            exit 1
+          fi
+
+          echo "package_build=passed"
+          echo "validation_status=passed"
