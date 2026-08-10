@@ -29,7 +29,7 @@ jobs:
         shell: bash
         env:
           TARGET_REPOSITORY: wva2ccyk-prog/ai-chef-runtime
-          TARGET_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
+          TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
           TARGET_SHA: ${{ inputs.sha || '05bd68103ca34d1ce0eaf062e874a53602483614' }}
         run: |
           set -Eeuo pipefail
