@@ -1,9 +1,6 @@
 name: Sealed Private Validation
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       sha:
@@ -30,7 +27,7 @@ jobs:
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: ${{ inputs.sha || '378ad145d3558ef7199cfcf52245fc6019db0205' }}
+          TARGET_SHA: ${{ inputs.sha }}
         run: |
           set -Eeuo pipefail
           umask 077
