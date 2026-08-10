@@ -7,9 +7,6 @@ on:
         description: Exact private commit SHA to validate
         required: true
         type: string
-  push:
-    paths:
-      - ".github/workflows/sanitized-verification-evidence.yml"
 
 permissions:
   contents: read
@@ -22,7 +19,7 @@ jobs:
     env:
       TARGET_REPOSITORY_ID: "1317466526"
       TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-      TARGET_SHA: ${{ inputs.sha || '5495265241767a336762680f181c62c66976b470' }}
+      TARGET_SHA: ${{ inputs.sha }}
 
     steps:
       - name: Set up Python
