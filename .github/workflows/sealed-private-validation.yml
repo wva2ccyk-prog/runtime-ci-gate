@@ -7,6 +7,9 @@ on:
         description: Exact private commit SHA to validate
         required: true
         type: string
+  push:
+    branches:
+      - main
 
 permissions: {}
 
@@ -27,13 +30,11 @@ jobs:
         env:
           TARGET_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
           TARGET_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
-          TARGET_SHA: ${{ inputs.sha }}
+          TARGET_SHA: ${{ inputs.sha || '05bd68103ca34d1ce0eaf062e874a53602483614' }}
         run: |
           set -Eeuo pipefail
           umask 077
 
-          # Register both secret-derived values for masking before any command
-          # that could accidentally mention them.
           printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
           printf '::add-mask::%s\n' "$TARGET_TOKEN"
 
@@ -78,7 +79,6 @@ jobs:
           export GIT_ASKPASS="$ASKPASS"
           export GIT_TERMINAL_PROMPT=0
 
-          # Nothing from private checkout is allowed onto the Actions log.
           if ! git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1; then
             echo "validation_status=checkout_failed"
             exit 1
@@ -102,8 +102,6 @@ jobs:
             exit 1
           fi
 
-          # The repository token is needed only for fetch. Remove credentials
-          # and target metadata before any private project code or build hook runs.
           unset TARGET_TOKEN
           unset GIT_ASKPASS
           rm -f "$ASKPASS"
@@ -111,8 +109,6 @@ jobs:
           unset TARGET_REPOSITORY
           unset TARGET_SHA
 
-          # Prevent private project processes from writing to Actions environment,
-          # output, summary, artifact, cache, or OIDC channels.
           SEALED_ENV=(
             env
             -u GITHUB_ENV
@@ -130,8 +126,6 @@ jobs:
 
           cd "$SRC"
 
-          # Suppress all setup output as well: dependency/build failures can
-          # contain paths, source snippets, metadata, or exception text.
           if ! "${SEALED_ENV[@]}" \
               python -m pip install --disable-pip-version-check --no-input ".[dev]" \
               >>"$PRIVATE_LOG" 2>&1; then
@@ -143,12 +137,10 @@ jobs:
             exit 1
           fi
 
-          # Capture pytest stdout/stderr completely. JUnit remains local and is
-          # parsed only for numeric counters; failure names/bodies are never printed.
           set +e
           "${SEALED_ENV[@]}" \
             python -m pytest -q --tb=no --disable-warnings --timeout=60 \
-            --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
+            -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
           TEST_RC=$?
           set -e
 
@@ -176,13 +168,52 @@ jobs:
           PY
           )"
 
-          # Destroy the private checkout, raw log, and JUnit before publishing
-          # the numeric result. No artifact or cache action is used.
+          FAILURE_RANKS="$(JUNIT_PATH="$JUNIT" SRC_PATH="$SRC" python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          src = Path(os.environ["SRC_PATH"]).resolve()
+          files = sorted(
+              p.relative_to(src).as_posix()
+              for p in (src / "tests").rglob("test_*.py")
+              if p.is_file()
+          )
+          ranks = {path: index for index, path in enumerate(files, start=1)}
+          bad = set()
+
+          try:
+              root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
+              for case in root.iter("testcase"):
+                  if case.find("failure") is None and case.find("error") is None:
+                      continue
+                  path = (case.attrib.get("file") or "").replace("\\", "/").lstrip("./")
+                  if path in ranks:
+                      bad.add(path)
+                      continue
+                  classname = case.attrib.get("classname", "")
+                  parts = [part for part in classname.split(".") if part]
+                  candidates = []
+                  for end in range(len(parts), 0, -1):
+                      candidates.append("/".join(parts[:end]) + ".py")
+                      candidates.append("tests/" + "/".join(parts[:end]) + ".py")
+                  for candidate in candidates:
+                      if candidate in ranks:
+                          bad.add(candidate)
+                          break
+          except Exception:
+              pass
+
+          print(",".join(str(ranks[path]) for path in sorted(bad, key=ranks.get)))
+          PY
+          )"
+
           cd "$HOME"
           cleanup
           trap - EXIT INT TERM
 
           echo "$COUNTS"
+          echo "failure_file_ranks=${FAILURE_RANKS:-unresolved}"
           if [[ "$TEST_RC" -eq 0 ]]; then
             echo "validation_status=passed"
             exit 0
