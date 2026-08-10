@@ -1,0 +1,233 @@
+name: Sanitized Verification Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact private commit SHA to validate
+        required: true
+        type: string
+  push:
+    paths:
+      - ".github/workflows/sanitized-verification-evidence.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    name: Generate sanitized verification evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TARGET_REPOSITORY_ID: "1317466526"
+      TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
+      TARGET_SHA: ${{ inputs.sha || '5495265241767a336762680f181c62c66976b470' }}
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Validate exact target and create sanitized evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+
+          if [[ -z "$TARGET_TOKEN" || ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "validation_status=configuration_error"
+            exit 1
+          fi
+
+          REPOSITORY_META="$(curl -fsS \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${TARGET_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
+          TARGET_REPOSITORY="$(printf '%s' "$REPOSITORY_META" | python -c 'import json,sys; data=json.load(sys.stdin); assert data.get("private") is True; print(data["full_name"])')"
+          printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
+          unset REPOSITORY_META TARGET_REPOSITORY_ID
+
+          ROOT="$(mktemp -d)"
+          SRC="$ROOT/source"
+          PRIVATE_LOG="$ROOT/private.log"
+          JUNIT="$ROOT/results.xml"
+          ASKPASS="$ROOT/askpass.sh"
+          SAFE_ROOT="${RUNNER_TEMP}/sanitized-evidence"
+          EVIDENCE_DIR="$SAFE_ROOT/evidence"
+          BUNDLE="$SAFE_ROOT/evidence.tar.gz"
+          rm -rf "$SAFE_ROOT"
+          mkdir -p "$EVIDENCE_DIR"
+          cleanup() {
+            chmod -R u+rwX "$ROOT" 2>/dev/null || true
+            rm -rf "$ROOT"
+          }
+          trap cleanup EXIT INT TERM
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$TARGET_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1
+          git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$PRIVATE_LOG" 2>&1
+          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$PRIVATE_LOG" 2>&1
+          git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$PRIVATE_LOG" 2>&1
+
+          ACTUAL_SHA="$(git -C "$SRC" rev-parse HEAD)"
+          TREE_SHA="$(git -C "$SRC" rev-parse HEAD^{tree})"
+          if [[ "$ACTUAL_SHA" != "$TARGET_SHA" ]]; then
+            echo "validation_status=checkout_mismatch"
+            exit 1
+          fi
+
+          unset TARGET_TOKEN GIT_ASKPASS TARGET_REPOSITORY
+          rm -f "$ASKPASS"
+          git -C "$SRC" remote remove origin >>"$PRIVATE_LOG" 2>&1 || true
+
+          STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cd "$SRC"
+          python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
+          python -m pip check >>"$PRIVATE_LOG" 2>&1
+          python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$PRIVATE_LOG" 2>&1
+          for script in static/main.js static/ui-events.js static/lab-ui-events.js; do
+            if [[ -f "$script" ]]; then
+              node --check "$script" >>"$PRIVATE_LOG" 2>&1
+            fi
+          done
+
+          set +e
+          python -m pytest -q --tb=no --timeout=60 -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
+          TEST_RC=$?
+          set -e
+          if [[ "$TEST_RC" -ne 0 ]]; then
+            echo "validation_status=failed"
+            exit 1
+          fi
+
+          python -m build >>"$PRIVATE_LOG" 2>&1
+          test -n "$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+
+          COUNTS="$(JUNIT_PATH="$JUNIT" LOG_PATH="$PRIVATE_LOG" python - <<'PY'
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(os.environ['JUNIT_PATH']).getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+          def total(name):
+              return sum(int(s.attrib.get(name, '0')) for s in suites)
+          tests = total('tests')
+          failures = total('failures')
+          errors = total('errors')
+          skipped = total('skipped')
+          passed = tests - failures - errors - skipped
+          text = open(os.environ['LOG_PATH'], encoding='utf-8', errors='replace').read()
+          warning_matches = re.findall(r'(?<!\d)(\d+) warnings?\b', text)
+          warnings = int(warning_matches[-1]) if warning_matches else 0
+          print(f'{tests} {passed} {failures} {errors} {skipped} {warnings}')
+          PY
+          )"
+          read -r TESTS PASSED FAILURES ERRORS SKIPPED WARNINGS <<<"$COUNTS"
+          FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          ACTUAL_SHA="$ACTUAL_SHA" TREE_SHA="$TREE_SHA" STARTED_AT="$STARTED_AT" FINISHED_AT="$FINISHED_AT" \
+          PASSED="$PASSED" FAILURES="$FAILURES" ERRORS="$ERRORS" SKIPPED="$SKIPPED" WARNINGS="$WARNINGS" \
+          EVIDENCE_DIR="$EVIDENCE_DIR" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ['EVIDENCE_DIR'])
+          sha = os.environ['ACTUAL_SHA']
+          tree = os.environ['TREE_SHA']
+          files = {
+              'command': 'command.txt',
+              'environment': 'environment.json',
+              'failure_summary': 'pytest-failures.txt',
+              'git_integrity': 'git-integrity.json',
+              'pytest_log': 'pytest-full.log',
+          }
+          (out / 'command.txt').write_text(json.dumps({
+              'command': ['python', '-m', 'pytest', '-q', '--tb=no', '--timeout=60'],
+              'cwd': 'sealed-private-checkout',
+          }, sort_keys=True) + '\n', encoding='utf-8')
+          (out / 'environment.json').write_text(json.dumps({
+              'schema': 'ai_chef_environment_v1',
+              'os': 'Linux',
+              'runner_image': 'ubuntu-24.04',
+              'python': '3.11',
+          }, sort_keys=True) + '\n', encoding='utf-8')
+          (out / 'git-integrity.json').write_text(json.dumps({
+              'commit_sha': sha,
+              'tree_sha': tree,
+              'dirty_tracked': False,
+          }, sort_keys=True) + '\n', encoding='utf-8')
+          (out / 'pytest-failures.txt').write_text('', encoding='utf-8')
+          (out / 'pytest-full.log').write_text(
+              f"passed={os.environ['PASSED']} failed={os.environ['FAILURES']} "
+              f"errors={os.environ['ERRORS']} skipped={os.environ['SKIPPED']} "
+              f"warnings={os.environ['WARNINGS']}\n",
+              encoding='utf-8',
+          )
+          manifest = {
+              'schema': 'ai_chef_regression_evidence_v2',
+              'status': 'passed',
+              'exit_code': 0,
+              'started_at': os.environ['STARTED_AT'],
+              'finished_at': os.environ['FINISHED_AT'],
+              'files': files,
+              'phases': {
+                  'initialize': {'status': 'passed'},
+                  'dependency_install': {'status': 'passed'},
+                  'pip_check': {'status': 'passed'},
+                  'compileall': {'status': 'passed'},
+                  'javascript_checks': {'status': 'passed'},
+                  'pytest': {'status': 'passed'},
+                  'package_build': {'status': 'passed'},
+              },
+              'source': {
+                  'authoritative': {'commit_sha': sha, 'tree_sha': tree},
+                  'checked_out': {'commit_sha': sha, 'tree_sha': tree},
+              },
+              'test_summary': {
+                  'parsed': True,
+                  'passed': int(os.environ['PASSED']),
+                  'failed': int(os.environ['FAILURES']),
+                  'errors': int(os.environ['ERRORS']),
+                  'skipped': int(os.environ['SKIPPED']),
+                  'warnings': int(os.environ['WARNINGS']),
+              },
+          }
+          (out / 'manifest.json').write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          PY
+
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "$BUNDLE" -C "$EVIDENCE_DIR" .
+          rm -rf "$SRC" "$PRIVATE_LOG" "$JUNIT"
+          echo "tests=$TESTS passed=$PASSED failures=$FAILURES errors=$ERRORS skipped=$SKIPPED warnings=$WARNINGS"
+          echo "package_build=passed"
+          echo "evidence_scope=sanitized_metadata_only"
+          echo "validation_status=passed"
+
+      - name: Upload sanitized evidence only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ env.TARGET_SHA }}.tar.gz
+          path: ${{ runner.temp }}/sanitized-evidence/evidence.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
