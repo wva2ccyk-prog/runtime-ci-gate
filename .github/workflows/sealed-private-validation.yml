@@ -1,4 +1,4 @@
-name: Sealed Private Focused Validation
+name: Sealed Private Full Validation
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   validate:
-    name: Validate sealed SEC-001D integration target
+    name: Validate sealed SEC-001D integration target full suite
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run sealed focused validation
+      - name: Run sealed full validation
         id: validate
         shell: bash
         env:
@@ -95,21 +95,12 @@ jobs:
           "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
           "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1
           "${SEALED_ENV[@]}" python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$PRIVATE_LOG" 2>&1
+          for script in static/main.js static/ui-events.js static/lab-ui-events.js; do
+            [[ ! -f "$script" ]] || node --check "$script" >>"$PRIVATE_LOG" 2>&1
+          done
 
           "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=60 \
-            -o junit_family=legacy --junitxml="$JUNIT" \
-            tests/test_sec001d_owner_adaptation_state.py \
-            tests/test_sec001d_owner_adaptation_concurrency.py \
-            tests/test_p7_user_isolation.py \
-            tests/test_inventory_migration_review.py \
-            tests/test_privacy_export_owner_scope.py \
-            tests/test_state_recovery_privacy_lifecycle.py \
-            tests/test_kitchen_profile_v11.py \
-            tests/test_kitchen_state_patch.py \
-            tests/test_wine.py \
-            tests/test_sec001c_attempt_state_diagnostics.py \
-            >"$PRIVATE_LOG" 2>&1
-
+            -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
           COUNTS="$(JUNIT_PATH="$JUNIT" python - <<'PY'
           import os
           import xml.etree.ElementTree as ET
@@ -120,10 +111,19 @@ jobs:
           PY
           )"
           read -r TESTS FAILURES ERRORS SKIPPED <<<"$COUNTS"
+
+          "${SEALED_ENV[@]}" python -m build >"$PRIVATE_LOG" 2>&1
+          WHEELS=(dist/*.whl)
+          SDISTS=(dist/*.tar.gz)
+          [[ -e "${WHEELS[0]}" ]]
+          [[ -e "${SDISTS[0]}" ]]
+
           echo "tests=$TESTS failures=$FAILURES errors=$ERRORS skipped=$SKIPPED"
           echo "dependency_validation=passed"
           echo "compile=passed"
-          echo "focused_scope=sec001d_owner_isolation_concurrency_inventory_privacy_state_sec001c"
+          echo "package_build=passed"
+          echo "wheel=passed"
+          echo "sdist=passed"
           echo "validation_status=passed"
           echo "tests=$TESTS" >>"$GITHUB_OUTPUT"
           echo "failures=$FAILURES" >>"$GITHUB_OUTPUT"
@@ -142,12 +142,12 @@ jobs:
           TARGET_SHA: "1ad3173b8bdb81ac1b601b4b86c46144cfe4e56f"
         run: |
           set -Eeuo pipefail
-          PATH_NAME=".validation-results/sec-001d-focused-${GITHUB_RUN_ID}.json"
+          PATH_NAME=".validation-results/sec-001d-full-${GITHUB_RUN_ID}.json"
           RESULT="$(python - <<'PY'
           import json, os
           print(json.dumps({
               "schema": "sealed_validation_result_v1",
-              "scope": "sec-001d-focused",
+              "scope": "sec-001d-full",
               "target_sha": os.environ["TARGET_SHA"],
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
               "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
@@ -157,16 +157,19 @@ jobs:
               "failures": int(os.environ["FAILURES"]),
               "errors": int(os.environ["ERRORS"]),
               "skipped": int(os.environ["SKIPPED"]),
+              "package_build": "passed",
+              "wheel": "passed",
+              "sdist": "passed",
               "validation_status": "passed"
           }, sort_keys=True))
           PY
           )"
-          export ENCODED
           ENCODED="$(printf '%s\n' "$RESULT" | base64 -w0)"
+          export ENCODED
           BODY="$(python - <<'PY'
           import json, os
           print(json.dumps({
-              "message": "ci: publish sanitized SEC-001D focused result [skip ci]",
+              "message": "ci: publish sanitized SEC-001D full result [skip ci]",
               "content": os.environ["ENCODED"],
               "branch": "ci/sec-001d-closure"
           }))
