@@ -161,6 +161,7 @@ jobs:
           }, sort_keys=True))
           PY
           )"
+          export ENCODED
           ENCODED="$(printf '%s\n' "$RESULT" | base64 -w0)"
           BODY="$(python - <<'PY'
           import json, os
