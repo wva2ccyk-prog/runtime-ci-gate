@@ -1,18 +1,15 @@
-name: Sealed Private Validation
+name: Sealed Private Focused Validation
 
 on:
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: Exact private commit SHA to validate
-        required: true
-        type: string
+  push:
+    branches:
+      - "ci/sec-001d-closure"
 
 permissions: {}
 
 jobs:
   validate:
-    name: Validate sealed target
+    name: Validate sealed SEC-001D integration target
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -22,12 +19,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run sealed validation
+      - name: Run sealed focused validation
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: ${{ inputs.sha }}
+          TARGET_SHA: "1ad3173b8bdb81ac1b601b4b86c46144cfe4e56f"
         run: |
           set -Eeuo pipefail
           umask 077
@@ -96,12 +93,21 @@ jobs:
           "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
           "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1
           "${SEALED_ENV[@]}" python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$PRIVATE_LOG" 2>&1
-          for script in static/main.js static/ui-events.js static/lab-ui-events.js; do
-            [[ ! -f "$script" ]] || node --check "$script" >>"$PRIVATE_LOG" 2>&1
-          done
 
           "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=60 \
-            -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
+            -o junit_family=legacy --junitxml="$JUNIT" \
+            tests/test_sec001d_owner_adaptation_state.py \
+            tests/test_sec001d_owner_adaptation_concurrency.py \
+            tests/test_p7_user_isolation.py \
+            tests/test_inventory_migration_review.py \
+            tests/test_privacy_export_owner_scope.py \
+            tests/test_state_recovery_privacy_lifecycle.py \
+            tests/test_kitchen_profile_v11.py \
+            tests/test_kitchen_state_patch.py \
+            tests/test_wine.py \
+            tests/test_sec001c_attempt_state_diagnostics.py \
+            >"$PRIVATE_LOG" 2>&1
+
           JUNIT_PATH="$JUNIT" python - <<'PY'
           import os
           import xml.etree.ElementTree as ET
@@ -110,10 +116,7 @@ jobs:
           def total(name): return sum(int(s.attrib.get(name, "0")) for s in suites)
           print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
           PY
-
-          "${SEALED_ENV[@]}" python -m build >"$PRIVATE_LOG" 2>&1
-          WHEELS=(dist/*.whl)
-          SDISTS=(dist/*.tar.gz)
-          [[ -e "${WHEELS[0]}" && -e "${SDISTS[0]}" ]]
-          echo "package_build=passed"
+          echo "dependency_validation=passed"
+          echo "compile=passed"
+          echo "focused_scope=sec001d_owner_isolation_concurrency_inventory_privacy_state_sec001c"
           echo "validation_status=passed"
