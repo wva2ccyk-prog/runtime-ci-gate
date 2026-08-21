@@ -1,0 +1,1 @@
+{"compile": "passed", "dependency_validation": "passed", "errors": 0, "failures": 0, "run_attempt": 1, "run_id": 32444576751, "schema": "sealed_validation_result_v1", "scope": "sec-001d-focused", "skipped": 0, "target_sha": "1ad3173b8bdb81ac1b601b4b86c46144cfe4e56f", "tests": 132, "validation_status": "passed"}
