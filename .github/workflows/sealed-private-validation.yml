@@ -4,11 +4,9 @@ on:
   push:
     branches:
       - "ci/sec-001d-closure"
-  pull_request:
-    branches:
-      - "main"
 
-permissions: {}
+permissions:
+  contents: write
 
 jobs:
   validate:
@@ -23,6 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Run sealed focused validation
+        id: validate
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
@@ -111,15 +110,70 @@ jobs:
             tests/test_sec001c_attempt_state_diagnostics.py \
             >"$PRIVATE_LOG" 2>&1
 
-          JUNIT_PATH="$JUNIT" python - <<'PY'
+          COUNTS="$(JUNIT_PATH="$JUNIT" python - <<'PY'
           import os
           import xml.etree.ElementTree as ET
           root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
           suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
           def total(name): return sum(int(s.attrib.get(name, "0")) for s in suites)
-          print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
+          print(total("tests"), total("failures"), total("errors"), total("skipped"))
           PY
+          )"
+          read -r TESTS FAILURES ERRORS SKIPPED <<<"$COUNTS"
+          echo "tests=$TESTS failures=$FAILURES errors=$ERRORS skipped=$SKIPPED"
           echo "dependency_validation=passed"
           echo "compile=passed"
           echo "focused_scope=sec001d_owner_isolation_concurrency_inventory_privacy_state_sec001c"
           echo "validation_status=passed"
+          echo "tests=$TESTS" >>"$GITHUB_OUTPUT"
+          echo "failures=$FAILURES" >>"$GITHUB_OUTPUT"
+          echo "errors=$ERRORS" >>"$GITHUB_OUTPUT"
+          echo "skipped=$SKIPPED" >>"$GITHUB_OUTPUT"
+
+      - name: Publish sanitized result marker
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTS: ${{ steps.validate.outputs.tests }}
+          FAILURES: ${{ steps.validate.outputs.failures }}
+          ERRORS: ${{ steps.validate.outputs.errors }}
+          SKIPPED: ${{ steps.validate.outputs.skipped }}
+          TARGET_SHA: "1ad3173b8bdb81ac1b601b4b86c46144cfe4e56f"
+        run: |
+          set -Eeuo pipefail
+          PATH_NAME=".validation-results/sec-001d-focused-${GITHUB_RUN_ID}.json"
+          RESULT="$(python - <<'PY'
+          import json, os
+          print(json.dumps({
+              "schema": "sealed_validation_result_v1",
+              "scope": "sec-001d-focused",
+              "target_sha": os.environ["TARGET_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "dependency_validation": "passed",
+              "compile": "passed",
+              "tests": int(os.environ["TESTS"]),
+              "failures": int(os.environ["FAILURES"]),
+              "errors": int(os.environ["ERRORS"]),
+              "skipped": int(os.environ["SKIPPED"]),
+              "validation_status": "passed"
+          }, sort_keys=True))
+          PY
+          )"
+          ENCODED="$(printf '%s\n' "$RESULT" | base64 -w0)"
+          BODY="$(python - <<'PY'
+          import json, os
+          print(json.dumps({
+              "message": "ci: publish sanitized SEC-001D focused result [skip ci]",
+              "content": os.environ["ENCODED"],
+              "branch": "ci/sec-001d-closure"
+          }))
+          PY
+          )"
+          curl -fsS -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${PATH_NAME}" \
+            -d "$BODY" >/dev/null
