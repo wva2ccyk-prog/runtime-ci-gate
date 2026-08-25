@@ -50,12 +50,14 @@ jobs:
             tests/test_postgresql_integration.py::test_postgresql_inventory_plaintext_hashed_coexistence_conversion >/dev/null 2>&1
           STATUS=$?; set -e
           JUNIT_PATH="$JUNIT" python - <<'PY'
-          import os,re,xml.etree.ElementTree as ET
+          import os,xml.etree.ElementTree as ET
           root=ET.parse(os.environ['JUNIT_PATH']).getroot()
           for case in root.iter('testcase'):
-              node=case.find('failure') or case.find('error')
+              node=case.find('failure')
+              if node is None:
+                  node=case.find('error')
               if node is not None:
-                  text=re.sub(r'/[^\s:]+','<path>',node.text or '')
-                  print('failure_detail='+text[-700:].replace('\n',' | '))
+                  print('failed_test='+case.attrib.get('name',''))
+                  print('failure_message='+str(node.attrib.get('message',''))[:500].replace('\n',' | '))
           PY
           exit "$STATUS"
