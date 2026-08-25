@@ -6,7 +6,7 @@ permissions: {}
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:18.4-bookworm
@@ -23,12 +23,12 @@ jobs:
     steps:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with: {python-version: "3.11"}
-      - name: Validate exact SEC-001G head
+      - name: Validate refreshed SEC-001G exact head
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: "63928332318967b2a4686f726c3b5645e4d01016"
+          TARGET_SHA: "a0e69c7f70856dc7d75750ee26271f87d7237b24"
         run: |
           set -Eeuo pipefail; umask 077; printf '::add-mask::%s\n' "$TARGET_TOKEN"
           META="$(curl -fsS -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
@@ -51,10 +51,13 @@ jobs:
           print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
           PY
           echo full_pytest=passed
+          AI_CHEF_TEST_POSTGRES_URL='postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test' \
+          AI_CHEF_POSTGRES_INTEGRATION=1 AI_CHEF_DB_AUTO_MIGRATE=1 \
+          python -m pytest -q --timeout=90 --timeout-method=thread tests/test_validation_capture_postgresql.py >>"$LOG" 2>&1
+          echo validation_capture_postgres=passed
           AI_CHEF_DATABASE_BACKEND=postgresql \
           AI_CHEF_DATABASE_URL='postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test' \
-          AI_CHEF_DB_AUTO_MIGRATE=1 \
-          AI_CHEF_ALLOW_POSTGRES_TEST_RESET=1 \
+          AI_CHEF_DB_AUTO_MIGRATE=1 AI_CHEF_ALLOW_POSTGRES_TEST_RESET=1 \
           python - <<'PY'
           from concurrent.futures import ThreadPoolExecutor
           from core import database
@@ -78,9 +81,9 @@ jobs:
           with ThreadPoolExecutor(max_workers=2) as p: results=list(p.map(attempt,("first","second")))
           assert sorted(k for k,_ in results)==["conflict","ok"],results
           final=gaps.list_gaps(a,status="reviewed",limit=10); assert len(final["items"])==1 and final["items"][0]["revision"]==rev+1
-          print("postgres_owner_isolation=passed"); print("postgres_concurrency=passed"); database.close_pools()
+          print("postgres_catalog_gap_owner_isolation=passed"); print("postgres_catalog_gap_concurrency=passed"); database.close_pools()
           PY
           python -m build >>"$LOG" 2>&1; WHEEL=(dist/*.whl); SDIST=(dist/*.tar.gz); [[ -e "${WHEEL[0]}" && -e "${SDIST[0]}" ]]; echo wheel=passed; echo sdist=passed
           python -m venv --system-site-packages "$ROOT/installed"; "$ROOT/installed/bin/python" -m pip install --disable-pip-version-check --no-input --force-reinstall --no-deps "${WHEEL[0]}" >>"$LOG" 2>&1
-          (cd "$ROOT"; PYTHONPATH= "$ROOT/installed/bin/ai-chef-migrate-catalog-gaps" --help >/dev/null)
-          echo installed_artifact=passed; echo validation_status=passed
+          (cd "$ROOT"; PYTHONPATH= "$ROOT/installed/bin/ai-chef-migrate-catalog-gaps" --help >/dev/null; PYTHONPATH= "$ROOT/installed/bin/python" -m core.validation_capture_migration --help >/dev/null)
+          echo installed_catalog_gap_cli=passed; echo installed_validation_capture_cli=passed; echo validation_status=passed
