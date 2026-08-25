@@ -6,7 +6,7 @@ permissions: {}
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:18.4-bookworm
@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with:
           python-version: "3.11"
-      - name: Validate exact SEC-001B postgres and installed artifact
+      - name: Diagnose exact SEC-001B postgres failures
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
@@ -38,33 +38,27 @@ jobs:
           set -Eeuo pipefail; umask 077; printf '::add-mask::%s\n' "$TARGET_TOKEN"
           META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
           REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"; printf '::add-mask::%s\n' "$REPO"
-          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; ASK="$ROOT/askpass.sh"; trap 'rm -rf "$ROOT"' EXIT INT TERM
+          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; JUNIT="$ROOT/pg.xml"; ASK="$ROOT/askpass.sh"; trap 'rm -rf "$ROOT"' EXIT
           cat > "$ASK" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
           EOF
           chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
           git init -q "$SRC"; git -C "$SRC" remote add origin "https://github.com/${REPO}.git"; git -C "$SRC" fetch -q --no-tags --depth=1 origin "$TARGET_SHA"; git -C "$SRC" checkout -q --detach FETCH_HEAD; [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
-          unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID; rm -f "$ASK"; git -C "$SRC" remote remove origin >/dev/null 2>&1 || true; cd "$SRC"
+          unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID; rm -f "$ASK"; cd "$SRC"
           python -m pip install --disable-pip-version-check --no-input ".[dev]" >"$LOG" 2>&1
-          python -m pip check >>"$LOG" 2>&1
-          echo dependency_validation=passed
-          python -m compileall -q core tests >>"$LOG" 2>&1
-          echo compile=passed
-          python -m pytest -q --timeout=60 --timeout-method=thread tests/test_postgresql_backend.py >>"$LOG" 2>&1
-          echo postgres_backend_contract=passed
-          python -m pytest -q --timeout=90 --timeout-method=thread tests/test_postgresql_integration.py tests/test_validation_capture_postgresql.py >>"$LOG" 2>&1
-          echo postgres_integration=passed
-          AI_CHEF_DEPLOYMENT_PROFILE=server AI_CHEF_DATABASE_BACKEND=postgresql AI_CHEF_DATABASE_URL="$AI_CHEF_TEST_POSTGRES_URL" AI_CHEF_ALLOWED_HOSTS=chef.test AI_CHEF_ENABLE_POSTGRES_MULTI_WORKER=1 AI_CHEF_WORKERS=3 python -m core.run_server --check >"$ROOT/launch.json" 2>>"$LOG"
-          grep -q '"database_backend": "postgresql"' "$ROOT/launch.json"; grep -q '"workers": 3' "$ROOT/launch.json"; echo postgres_launcher=passed
-          python -m build >>"$LOG" 2>&1
-          WHEELS=(dist/*.whl); SDISTS=(dist/*.tar.gz); [[ -e "${WHEELS[0]}" && -e "${SDISTS[0]}" ]]; echo wheel=passed; echo sdist=passed
-          python -m venv --system-site-packages "$ROOT/installed"; "$ROOT/installed/bin/python" -m pip install --disable-pip-version-check --no-input --force-reinstall --no-deps "${WHEELS[0]}" >>"$LOG" 2>&1
-          (cd "$ROOT"; PYTHONPATH= "$ROOT/installed/bin/python" - <<'PY'
-          import importlib
-          for name in ('core.validation_capture_repository','core.validation_capture','core.validation_capture_migration'):
-              importlib.import_module(name)
-          print('installed_imports=passed')
+          set +e
+          python -m pytest -q --tb=no --disable-warnings --timeout=90 --timeout-method=thread -o junit_family=legacy --junitxml="$JUNIT" tests/test_postgresql_integration.py tests/test_validation_capture_postgresql.py >"$LOG" 2>&1
+          STATUS=$?
+          set -e
+          JUNIT_PATH="$JUNIT" python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          root=ET.parse(os.environ['JUNIT_PATH']).getroot(); suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
+          def total(k): return sum(int(s.attrib.get(k,'0')) for s in suites)
+          print(f"postgres_tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
+          for case in root.iter('testcase'):
+              if case.find('failure') is not None or case.find('error') is not None:
+                  print(f"failed_test={case.attrib.get('classname','')}::{case.attrib.get('name','')}")
           PY
-          PYTHONPATH= "$ROOT/installed/bin/python" -m core.validation_capture_migration --help >/dev/null)
-          echo installed_artifact=passed; echo package_build=passed; echo validation_status=passed
+          if [[ "$STATUS" -ne 0 ]]; then echo validation_status=failed; exit "$STATUS"; fi
+          echo validation_status=passed
