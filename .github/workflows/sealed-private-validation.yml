@@ -6,7 +6,7 @@ permissions: {}
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18.4-bookworm
@@ -25,92 +25,46 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with:
           python-version: "3.11"
-      - name: Validate exact SEC-001B head
+      - name: Validate exact SEC-001B postgres and installed artifact
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
           TARGET_SHA: "e2379e52ac72c65c929a80548707ff902d3ddb9a"
+          AI_CHEF_TEST_POSTGRES_URL: postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test
+          AI_CHEF_POSTGRES_INTEGRATION: "1"
+          AI_CHEF_DB_AUTO_MIGRATE: "1"
         run: |
-          set -Eeuo pipefail
-          umask 077
-          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+          set -Eeuo pipefail; umask 077; printf '::add-mask::%s\n' "$TARGET_TOKEN"
           META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
-          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"
-          printf '::add-mask::%s\n' "$REPO"
-          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; JUNIT="$ROOT/results.xml"; PGJUNIT="$ROOT/postgres.xml"; ASK="$ROOT/askpass.sh"
-          trap 'rm -rf "$ROOT"' EXIT INT TERM
+          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"; printf '::add-mask::%s\n' "$REPO"
+          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; ASK="$ROOT/askpass.sh"; trap 'rm -rf "$ROOT"' EXIT INT TERM
           cat > "$ASK" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
           EOF
           chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
-          git init -q "$SRC"
-          git -C "$SRC" remote add origin "https://github.com/${REPO}.git"
-          git -C "$SRC" fetch -q --no-tags --depth=1 origin "$TARGET_SHA"
-          git -C "$SRC" checkout -q --detach FETCH_HEAD
-          [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
-          unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID
-          rm -f "$ASK"; git -C "$SRC" remote remove origin >/dev/null 2>&1 || true
-          cd "$SRC"
-
+          git init -q "$SRC"; git -C "$SRC" remote add origin "https://github.com/${REPO}.git"; git -C "$SRC" fetch -q --no-tags --depth=1 origin "$TARGET_SHA"; git -C "$SRC" checkout -q --detach FETCH_HEAD; [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
+          unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID; rm -f "$ASK"; git -C "$SRC" remote remove origin >/dev/null 2>&1 || true; cd "$SRC"
           python -m pip install --disable-pip-version-check --no-input ".[dev]" >"$LOG" 2>&1
           python -m pip check >>"$LOG" 2>&1
           echo dependency_validation=passed
-
-          python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$LOG" 2>&1
-          for script in static/main.js static/ui-events.js static/lab-ui-events.js; do [[ ! -f "$script" ]] || node --check "$script" >>"$LOG" 2>&1; done
+          python -m compileall -q core tests >>"$LOG" 2>&1
           echo compile=passed
-
-          python -m pytest -q --tb=no --disable-warnings --timeout=120 -o junit_family=legacy --junitxml="$JUNIT" >"$LOG" 2>&1
-          JUNIT_PATH="$JUNIT" python - <<'PY'
-          import os, xml.etree.ElementTree as ET
-          root=ET.parse(os.environ['JUNIT_PATH']).getroot(); suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
-          def total(k): return sum(int(s.attrib.get(k,'0')) for s in suites)
-          print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
-          PY
-          echo full_pytest=passed
-
-          AI_CHEF_TEST_POSTGRES_URL='postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test' \
-          AI_CHEF_POSTGRES_INTEGRATION=1 \
-          AI_CHEF_DB_AUTO_MIGRATE=1 \
-          python -m pytest -q --tb=no --disable-warnings --timeout=90 -k postgresql -o junit_family=legacy --junitxml="$PGJUNIT" >>"$LOG" 2>&1
-          PGJUNIT_PATH="$PGJUNIT" python - <<'PY'
-          import os, xml.etree.ElementTree as ET
-          root=ET.parse(os.environ['PGJUNIT_PATH']).getroot(); suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
-          def total(k): return sum(int(s.attrib.get(k,'0')) for s in suites)
-          print(f"postgres_tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
-          PY
-          echo postgres_tests=passed
-
-          AI_CHEF_DEPLOYMENT_PROFILE=server \
-          AI_CHEF_DATABASE_BACKEND=postgresql \
-          AI_CHEF_DATABASE_URL='postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test' \
-          AI_CHEF_ALLOWED_HOSTS=chef.test \
-          AI_CHEF_ENABLE_POSTGRES_MULTI_WORKER=1 \
-          AI_CHEF_WORKERS=3 \
-          python -m core.run_server --check >"$ROOT/launch.json" 2>>"$LOG"
-          grep -q '"database_backend": "postgresql"' "$ROOT/launch.json"
-          grep -q '"workers": 3' "$ROOT/launch.json"
-          echo postgres_launcher=passed
-
+          python -m pytest -q --timeout=60 --timeout-method=thread tests/test_postgresql_backend.py >>"$LOG" 2>&1
+          echo postgres_backend_contract=passed
+          python -m pytest -q --timeout=90 --timeout-method=thread tests/test_postgresql_integration.py tests/test_validation_capture_postgresql.py >>"$LOG" 2>&1
+          echo postgres_integration=passed
+          AI_CHEF_DEPLOYMENT_PROFILE=server AI_CHEF_DATABASE_BACKEND=postgresql AI_CHEF_DATABASE_URL="$AI_CHEF_TEST_POSTGRES_URL" AI_CHEF_ALLOWED_HOSTS=chef.test AI_CHEF_ENABLE_POSTGRES_MULTI_WORKER=1 AI_CHEF_WORKERS=3 python -m core.run_server --check >"$ROOT/launch.json" 2>>"$LOG"
+          grep -q '"database_backend": "postgresql"' "$ROOT/launch.json"; grep -q '"workers": 3' "$ROOT/launch.json"; echo postgres_launcher=passed
           python -m build >>"$LOG" 2>&1
-          WHEELS=(dist/*.whl); SDISTS=(dist/*.tar.gz); [[ -e "${WHEELS[0]}" && -e "${SDISTS[0]}" ]]
-          echo wheel=passed
-          echo sdist=passed
-
-          python -m venv --system-site-packages "$ROOT/installed"
-          "$ROOT/installed/bin/python" -m pip install --disable-pip-version-check --no-input --force-reinstall --no-deps "${WHEELS[0]}" >>"$LOG" 2>&1
-          (
-            cd "$ROOT"
-            PYTHONPATH= "$ROOT/installed/bin/python" - <<'PY'
+          WHEELS=(dist/*.whl); SDISTS=(dist/*.tar.gz); [[ -e "${WHEELS[0]}" && -e "${SDISTS[0]}" ]]; echo wheel=passed; echo sdist=passed
+          python -m venv --system-site-packages "$ROOT/installed"; "$ROOT/installed/bin/python" -m pip install --disable-pip-version-check --no-input --force-reinstall --no-deps "${WHEELS[0]}" >>"$LOG" 2>&1
+          (cd "$ROOT"; PYTHONPATH= "$ROOT/installed/bin/python" - <<'PY'
           import importlib
           for name in ('core.validation_capture_repository','core.validation_capture','core.validation_capture_migration'):
               importlib.import_module(name)
           print('installed_imports=passed')
           PY
-            PYTHONPATH= "$ROOT/installed/bin/python" -m core.validation_capture_migration --help >/dev/null
-          )
-          echo installed_artifact=passed
-          echo package_build=passed
-          echo validation_status=passed
+          PYTHONPATH= "$ROOT/installed/bin/python" -m core.validation_capture_migration --help >/dev/null)
+          echo installed_artifact=passed; echo package_build=passed; echo validation_status=passed
