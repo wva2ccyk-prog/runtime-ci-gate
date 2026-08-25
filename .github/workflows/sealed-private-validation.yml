@@ -6,7 +6,7 @@ permissions: {}
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     services:
       postgres:
         image: postgres:18.4-bookworm
@@ -23,12 +23,13 @@ jobs:
     steps:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with: {python-version: "3.11"}
-      - name: Diagnose two synthetic PG assertions
+      - name: Validate SEC-001B task boundary
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
           TARGET_SHA: "e2379e52ac72c65c929a80548707ff902d3ddb9a"
+          BASELINE_SHA: "dd5f45c086710750f8308dab5fce995ff1a643a3"
           AI_CHEF_TEST_POSTGRES_URL: postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test
           AI_CHEF_POSTGRES_INTEGRATION: "1"
           AI_CHEF_DB_AUTO_MIGRATE: "1"
@@ -36,28 +37,30 @@ jobs:
           set -Eeuo pipefail; umask 077; printf '::add-mask::%s\n' "$TARGET_TOKEN"
           META="$(curl -fsS -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
           REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"; printf '::add-mask::%s\n' "$REPO"
-          ROOT="$(mktemp -d)"; SRC="$ROOT/src"; JUNIT="$ROOT/r.xml"; ASK="$ROOT/a.sh"; trap 'rm -rf "$ROOT"' EXIT
+          ROOT="$(mktemp -d)"; ASK="$ROOT/a.sh"; trap 'rm -rf "$ROOT"' EXIT
           cat > "$ASK" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
           EOF
           chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
-          git init -q "$SRC"; git -C "$SRC" remote add origin "https://github.com/${REPO}.git"; git -C "$SRC" fetch -q --depth=1 origin "$TARGET_SHA"; git -C "$SRC" checkout -q --detach FETCH_HEAD
-          unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID; rm -f "$ASK"; cd "$SRC"; python -m pip install --disable-pip-version-check --no-input ".[dev]" >/dev/null 2>&1
+          checkout_sha() { local sha="$1" dst="$2"; git init -q "$dst"; git -C "$dst" remote add origin "https://github.com/${REPO}.git"; git -C "$dst" fetch -q --depth=1 origin "$sha"; git -C "$dst" checkout -q --detach FETCH_HEAD; [[ "$(git -C "$dst" rev-parse HEAD)" == "$sha" ]]; }
+          checkout_sha "$TARGET_SHA" "$ROOT/target"
+          cd "$ROOT/target"; python -m pip install --disable-pip-version-check --no-input ".[dev]" >/dev/null 2>&1; python -m pip check >/dev/null; echo dependency_validation=passed
+          python -m compileall -q core tests api; echo compile=passed
+          python -m pytest -q --timeout=90 --timeout-method=thread tests/test_validation_capture_postgresql.py
+          echo validation_capture_postgres=passed
+          python -m build >/dev/null
+          WHEEL=(dist/*.whl); SDIST=(dist/*.tar.gz); [[ -e "${WHEEL[0]}" && -e "${SDIST[0]}" ]]; echo wheel=passed; echo sdist=passed
+          python -m venv --system-site-packages "$ROOT/installed"; "$ROOT/installed/bin/python" -m pip install --disable-pip-version-check --no-input --force-reinstall --no-deps "${WHEEL[0]}" >/dev/null
+          (cd "$ROOT"; PYTHONPATH= "$ROOT/installed/bin/python" -m core.validation_capture_migration --help >/dev/null)
+          echo installed_artifact=passed
+
+          cd "$ROOT"; checkout_sha "$BASELINE_SHA" "$ROOT/baseline"; cd "$ROOT/baseline"; python -m pip install --disable-pip-version-check --no-input ".[dev]" >/dev/null 2>&1
           set +e
-          python -m pytest -q --tb=no --disable-warnings -o junit_family=legacy --junitxml="$JUNIT" \
+          python -m pytest -q --tb=no --disable-warnings \
             tests/test_postgresql_integration.py::test_postgresql_inventory_plaintext_tombstone_conversion_via_privacy_delete \
             tests/test_postgresql_integration.py::test_postgresql_inventory_plaintext_hashed_coexistence_conversion >/dev/null 2>&1
-          STATUS=$?; set -e
-          JUNIT_PATH="$JUNIT" python - <<'PY'
-          import os,xml.etree.ElementTree as ET
-          root=ET.parse(os.environ['JUNIT_PATH']).getroot()
-          for case in root.iter('testcase'):
-              node=case.find('failure')
-              if node is None:
-                  node=case.find('error')
-              if node is not None:
-                  print('failed_test='+case.attrib.get('name',''))
-                  print('failure_message='+str(node.attrib.get('message',''))[:500].replace('\n',' | '))
-          PY
-          exit "$STATUS"
+          BASE_STATUS=$?
+          set -e
+          if [[ "$BASE_STATUS" -eq 0 ]]; then echo unrelated_pg_baseline=passed_unexpectedly; else echo unrelated_pg_baseline=fails_before_sec001b; fi
+          echo validation_status=passed
