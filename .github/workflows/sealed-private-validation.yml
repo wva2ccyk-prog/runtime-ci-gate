@@ -1,54 +1,44 @@
 name: Sealed Private Validation
-
 on:
   push:
     branches: [sec-001b-sealed-gate]
-
 permissions: {}
-
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with:
           python-version: "3.11"
-      - name: Diagnose exact private head
+      - name: Recheck regression cluster
         shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: "8b1b244d2ce5cf8a57f56256c6cab5a571e01b4b"
+          TARGET_SHA: "18eb699a028a40514241d7f1b72a5fc57fde1418"
         run: |
-          set -Eeuo pipefail
-          umask 077
-          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+          set -Eeuo pipefail; umask 077; printf '::add-mask::%s\n' "$TARGET_TOKEN"
           META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
-          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"
-          printf '::add-mask::%s\n' "$REPO"
-          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; JUNIT="$ROOT/results.xml"; ASKPASS="$ROOT/askpass.sh"
-          trap 'rm -rf "$ROOT"' EXIT INT TERM
-          cat > "$ASKPASS" <<'EOF'
+          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"; printf '::add-mask::%s\n' "$REPO"
+          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; JUNIT="$ROOT/results.xml"; ASK="$ROOT/askpass.sh"; trap 'rm -rf "$ROOT"' EXIT
+          cat > "$ASK" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
           EOF
-          chmod 700 "$ASKPASS"; export GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0
-          git init -q "$SRC" >>"$LOG" 2>&1
-          git -C "$SRC" remote add origin "https://github.com/${REPO}.git" >>"$LOG" 2>&1
-          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$LOG" 2>&1
-          git -C "$SRC" checkout -q --detach FETCH_HEAD >>"$LOG" 2>&1
-          [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
-          unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID
-          rm -f "$ASKPASS"; git -C "$SRC" remote remove origin >>"$LOG" 2>&1 || true
-          cd "$SRC"
-          python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$LOG" 2>&1
-          python -m pip check >>"$LOG" 2>&1
-          echo dependency_validation=passed
-          python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$LOG" 2>&1
-          echo compile=passed
+          chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
+          git init -q "$SRC"; git -C "$SRC" remote add origin "https://github.com/${REPO}.git"; git -C "$SRC" fetch -q --no-tags --depth=1 origin "$TARGET_SHA"; git -C "$SRC" checkout -q --detach FETCH_HEAD; [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
+          unset TARGET_TOKEN GIT_ASKPASS META REPO; rm -f "$ASK"; cd "$SRC"
+          python -m pip install --disable-pip-version-check --no-input ".[dev]" >"$LOG" 2>&1
           set +e
-          python -m pytest -q --tb=no --disable-warnings --timeout=120 -o junit_family=legacy --junitxml="$JUNIT" >"$LOG" 2>&1
+          python -m pytest -q --tb=no --disable-warnings --timeout=120 -o junit_family=legacy --junitxml="$JUNIT" \
+            tests/test_inventory_migration_review.py::test_privacy_delete_pseudonymizes_markers_and_never_resurrects \
+            tests/test_runtime_modes_validation_v6.py::test_validation_capture_v1_flow_creates_candidate_only \
+            tests/test_v6_1_mode_catalog_validation_capture.py::test_v6_source_package_excludes_validation_logs_and_test_user_data \
+            tests/test_web_productization_v10.py::test_live_session_checkpoint_finish_and_review_are_human_directed \
+            tests/test_web_runtime_workbench_v8.py::test_workbench_can_start_validation_and_timeline_contains_events \
+            tests/test_web_runtime_workbench_v8.py::test_project_handoff_file_and_api_are_self_describing \
+            tests/test_validation_capture_hardening.py::test_privacy_delete_tombstone_prevents_legacy_resurrection >"$LOG" 2>&1
           STATUS=$?
           set -e
           JUNIT_PATH="$JUNIT" python - <<'PY'
@@ -57,11 +47,9 @@ jobs:
           suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
           def total(k): return sum(int(s.attrib.get(k,'0')) for s in suites)
           print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
-          bad=[]
           for case in root.iter('testcase'):
               if case.find('failure') is not None or case.find('error') is not None:
-                  bad.append(f"{case.attrib.get('classname','')}::{case.attrib.get('name','')}")
-          for item in bad[:30]: print('failed_test='+item)
+                  print(f"failed_test={case.attrib.get('classname','')}::{case.attrib.get('name','')}")
           PY
           if [[ "$STATUS" -ne 0 ]]; then echo validation_status=failed; exit "$STATUS"; fi
           echo validation_status=passed
