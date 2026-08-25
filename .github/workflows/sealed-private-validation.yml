@@ -32,6 +32,6 @@ jobs:
           python -m pip install --disable-pip-version-check --no-input ".[dev]" >/dev/null
           python -m pytest -q tests/test_catalog_gap_packaging_cli.py --tb=no --disable-warnings
           python -m build >/dev/null
-          WHEEL=(dist/*.whl); python -m venv "$ROOT/venv"; "$ROOT/venv/bin/python" -m pip install --disable-pip-version-check --no-input --no-deps "${WHEEL[0]}" >/dev/null
+          WHEEL=(dist/*.whl); python -m venv --system-site-packages "$ROOT/venv"; "$ROOT/venv/bin/python" -m pip install --disable-pip-version-check --no-input --no-deps "${WHEEL[0]}" >/dev/null
           (cd "$ROOT"; PYTHONPATH= "$ROOT/venv/bin/ai-chef-migrate-catalog-gaps" --help >/dev/null)
           echo focused_green=true
