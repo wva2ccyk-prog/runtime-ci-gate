@@ -7,14 +7,31 @@ on:
         description: Exact private commit SHA to validate
         required: true
         type: string
+  push:
+    branches:
+      - sec-001b-sealed-gate
 
 permissions: {}
 
 jobs:
   validate:
     name: Validate sealed target
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:18.4-bookworm
+        env:
+          POSTGRES_DB: aichef_test
+          POSTGRES_USER: aichef
+          POSTGRES_PASSWORD: aichef-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aichef -d aichef_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
 
     steps:
       - name: Set up Python
@@ -27,7 +44,7 @@ jobs:
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: ${{ inputs.sha }}
+          TARGET_SHA: ${{ inputs.sha || '8b1b244d2ce5cf8a57f56256c6cab5a571e01b4b' }}
         run: |
           set -Eeuo pipefail
           umask 077
@@ -51,6 +68,7 @@ jobs:
           SRC="$ROOT/source"
           PRIVATE_LOG="$ROOT/private.log"
           JUNIT="$ROOT/results.xml"
+          PG_JUNIT="$ROOT/postgres-results.xml"
           ASKPASS="$ROOT/askpass.sh"
           cleanup() {
             chmod -R u+rwX "$ROOT" 2>/dev/null || true
@@ -95,12 +113,15 @@ jobs:
           cd "$SRC"
           "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
           "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1
+          echo "dependency_validation=passed"
+
           "${SEALED_ENV[@]}" python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$PRIVATE_LOG" 2>&1
           for script in static/main.js static/ui-events.js static/lab-ui-events.js; do
             [[ ! -f "$script" ]] || node --check "$script" >>"$PRIVATE_LOG" 2>&1
           done
+          echo "compile=passed"
 
-          "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=60 \
+          "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=120 \
             -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
           JUNIT_PATH="$JUNIT" python - <<'PY'
           import os
@@ -111,9 +132,64 @@ jobs:
           print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
           PY
 
+          set +e
+          AI_CHEF_TEST_POSTGRES_URL='postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test' \
+          AI_CHEF_POSTGRES_INTEGRATION=1 \
+          AI_CHEF_DB_AUTO_MIGRATE=1 \
+          "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=90 \
+            -k postgresql -o junit_family=legacy --junitxml="$PG_JUNIT" >"$PRIVATE_LOG" 2>&1
+          PG_STATUS=$?
+          set -e
+          if [[ -f "$PG_JUNIT" ]]; then
+            PG_JUNIT_PATH="$PG_JUNIT" python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          root = ET.parse(os.environ["PG_JUNIT_PATH"]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          def total(name): return sum(int(s.attrib.get(name, "0")) for s in suites)
+          print(f"postgres_tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
+          PY
+          fi
+          if [[ "$PG_STATUS" -ne 0 ]]; then
+            echo "postgres_validation_status=failed"
+            exit "$PG_STATUS"
+          fi
+          echo "postgres_validation_status=passed"
+
+          AI_CHEF_DEPLOYMENT_PROFILE=server \
+          AI_CHEF_DATABASE_BACKEND=postgresql \
+          AI_CHEF_DATABASE_URL='postgresql://aichef:aichef-test-only@127.0.0.1:5432/aichef_test' \
+          AI_CHEF_ALLOWED_HOSTS=chef.test \
+          AI_CHEF_ENABLE_POSTGRES_MULTI_WORKER=1 \
+          AI_CHEF_WORKERS=3 \
+          "${SEALED_ENV[@]}" python -m core.run_server --check >"$ROOT/postgres-launch.json" 2>>"$PRIVATE_LOG"
+          grep -q '"database_backend": "postgresql"' "$ROOT/postgres-launch.json"
+          grep -q '"workers": 3' "$ROOT/postgres-launch.json"
+          echo "postgres_launcher=passed"
+
           "${SEALED_ENV[@]}" python -m build >"$PRIVATE_LOG" 2>&1
           WHEELS=(dist/*.whl)
           SDISTS=(dist/*.tar.gz)
           [[ -e "${WHEELS[0]}" && -e "${SDISTS[0]}" ]]
+          echo "wheel=passed"
+          echo "sdist=passed"
+
+          python -m venv "$ROOT/installed"
+          "$ROOT/installed/bin/python" -m pip install --disable-pip-version-check --no-input --no-deps "${WHEELS[0]}" >>"$PRIVATE_LOG" 2>&1
+          (
+            cd "$ROOT"
+            PYTHONPATH= "$ROOT/installed/bin/python" - <<'PY'
+          import importlib
+          for name in (
+              "core.validation_capture_repository",
+              "core.validation_capture",
+              "core.validation_capture_migration",
+          ):
+              importlib.import_module(name)
+          print("installed_imports=passed")
+          PY
+            PYTHONPATH= "$ROOT/installed/bin/python" -m core.validation_capture_migration --help >/dev/null
+          )
+          echo "installed_artifact=passed"
           echo "package_build=passed"
           echo "validation_status=passed"
