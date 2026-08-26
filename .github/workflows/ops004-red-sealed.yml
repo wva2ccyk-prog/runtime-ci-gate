@@ -63,10 +63,14 @@ jobs:
           RC=$?
           set -e
           JUNIT_PATH="$JUNIT" python - <<'PY'
-          import os, xml.etree.ElementTree as ET
+          import hashlib, os, xml.etree.ElementTree as ET
           r=ET.parse(os.environ['JUNIT_PATH']).getroot(); s=[r] if r.tag=='testsuite' else list(r.findall('testsuite'))
           t=lambda n: sum(int(x.attrib.get(n,'0')) for x in s)
           print(f"tests={t('tests')} failures={t('failures')} errors={t('errors')} skipped={t('skipped')}")
+          for case in r.iter('testcase'):
+              if case.find('failure') is not None or case.find('error') is not None:
+                  ident=f"{case.attrib.get('classname','')}::{case.attrib.get('name','')}"
+                  print('failure_fingerprint='+hashlib.sha256(ident.encode('utf-8')).hexdigest())
           PY
           echo "sealed_sha=$ACTUAL"
           [[ "$RC" -eq 0 ]] && echo validation_status=passed || { echo validation_status=failed; exit 1; }
