@@ -23,7 +23,7 @@ jobs:
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: "e73cfb5f11710d0446e807d5e8ad9a7d01740ed1"
+          TARGET_SHA: "10ad98fa1d4ebb8a57ad378165c9ab67742df284"
         run: |
           set -Eeuo pipefail
           umask 077
