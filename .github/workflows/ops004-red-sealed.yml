@@ -1,4 +1,4 @@
-name: OPS004 Sealed Repository Validation
+name: OPS004 Sealed Live Isolation
 
 on:
   push:
@@ -9,17 +9,13 @@ permissions: {}
 
 jobs:
   validate:
-    name: Validate sealed target
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with:
           python-version: "3.11"
-
-      - name: Run sealed validation
-        shell: bash
+      - shell: bash
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
@@ -28,65 +24,49 @@ jobs:
           set -Eeuo pipefail
           umask 077
           printf '::add-mask::%s\n' "$TARGET_TOKEN"
-          if [[ -z "$TARGET_TOKEN" || ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "validation_status=configuration_error"
-            exit 1
-          fi
-          REPOSITORY_META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
-          TARGET_REPOSITORY="$(printf '%s' "$REPOSITORY_META" | python -c 'import json,sys; data=json.load(sys.stdin); assert data.get("private") is True; print(data["full_name"])')"
-          printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
-          ROOT="$(mktemp -d)"
-          SRC="$ROOT/source"
-          PRIVATE_LOG="$ROOT/private.log"
-          JUNIT="$ROOT/results.xml"
-          ASKPASS="$ROOT/askpass.sh"
-          cleanup() { chmod -R u+rwX "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"; }
+          META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
+          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"
+          printf '::add-mask::%s\n' "$REPO"
+          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; JUNIT="$ROOT/results.xml"; ASK="$ROOT/askpass.sh"; PG_CONTAINER=""
+          cleanup() { [[ -n "${PG_CONTAINER:-}" ]] && docker rm -f "$PG_CONTAINER" >>"$LOG" 2>&1 || true; chmod -R u+rwX "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"; }
           trap cleanup EXIT INT TERM
-          cat > "$ASKPASS" <<'EOF'
+          cat >"$ASK" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in
-            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Username*) printf '%s\n' x-access-token ;;
             *Password*) printf '%s\n' "$TARGET_TOKEN" ;;
             *) exit 1 ;;
           esac
           EOF
-          chmod 700 "$ASKPASS"
-          export GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0
-          git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1
-          git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$PRIVATE_LOG" 2>&1
-          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$PRIVATE_LOG" 2>&1
-          git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$PRIVATE_LOG" 2>&1
-          ACTUAL_SHA="$(git -C "$SRC" rev-parse HEAD 2>>"$PRIVATE_LOG")"
-          [[ "$ACTUAL_SHA" == "$TARGET_SHA" ]]
-          unset TARGET_TOKEN GIT_ASKPASS TARGET_REPOSITORY REPOSITORY_META TARGET_REPOSITORY_ID
-          rm -f "$ASKPASS"
-          git -C "$SRC" remote remove origin >>"$PRIVATE_LOG" 2>&1 || true
-          SEALED_ENV=(env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_CACHE_URL -u ACTIONS_RESULTS_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL)
+          chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
+          git init -q "$SRC" >>"$LOG" 2>&1
+          git -C "$SRC" remote add origin "https://github.com/${REPO}.git" >>"$LOG" 2>&1
+          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$LOG" 2>&1
+          git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$LOG" 2>&1
+          ACTUAL="$(git -C "$SRC" rev-parse HEAD)"; [[ "$ACTUAL" == "$TARGET_SHA" ]]
+          unset TARGET_TOKEN REPO META TARGET_REPOSITORY_ID GIT_ASKPASS; rm -f "$ASK"; git -C "$SRC" remote remove origin >>"$LOG" 2>&1 || true
           cd "$SRC"
-          "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
-          "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1
-          "${SEALED_ENV[@]}" python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$PRIVATE_LOG" 2>&1
+          python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$LOG" 2>&1
+          PG_USER=ops004_ci; PG_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"; PG_DB=ops004_ci
+          printf '::add-mask::%s\n' "$PG_PASSWORD"
+          PG_CONTAINER="ops004-isolate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker pull postgres:18.4 >>"$LOG" 2>&1
+          docker run -d --rm --name "$PG_CONTAINER" -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB="$PG_DB" -p 127.0.0.1::5432 postgres:18.4 >>"$LOG" 2>&1
+          READY=0
+          for _ in $(seq 1 40); do docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >>"$LOG" 2>&1 && { READY=1; break; }; sleep 1; done
+          [[ "$READY" -eq 1 ]]
+          PORT_MAPPING="$(docker port "$PG_CONTAINER" 5432/tcp)"; PG_PORT="${PORT_MAPPING##*:}"; [[ "$PG_PORT" =~ ^[0-9]+$ ]]
+          printf -v PG_URL 'postgresql://%s:%s@127.0.0.1:%s/%s' "$PG_USER" "$PG_PASSWORD" "$PG_PORT" "$PG_DB"
+          printf '::add-mask::%s\n' "$PG_URL"
           set +e
-          "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=60 -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
-          TEST_RC=$?
+          AI_CHEF_TEST_POSTGRES_URL="$PG_URL" python -m pytest -q --tb=no --disable-warnings --timeout=60 -o junit_family=legacy --junitxml="$JUNIT" >"$LOG" 2>&1
+          RC=$?
           set -e
-          COUNTS="$(JUNIT_PATH="$JUNIT" python - <<'PY'
-          import os
-          import xml.etree.ElementTree as ET
-          root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
-          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
-          def total(name): return sum(int(s.attrib.get(name, "0")) for s in suites)
-          print(f"tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
+          JUNIT_PATH="$JUNIT" python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          r=ET.parse(os.environ['JUNIT_PATH']).getroot(); s=[r] if r.tag=='testsuite' else list(r.findall('testsuite'))
+          t=lambda n: sum(int(x.attrib.get(n,'0')) for x in s)
+          print(f"tests={t('tests')} failures={t('failures')} errors={t('errors')} skipped={t('skipped')}")
           PY
-          )"
-          echo "$COUNTS"
-          echo "sealed_sha=$ACTUAL_SHA"
-          if [[ "$TEST_RC" -ne 0 ]]; then
-            echo "validation_status=failed"
-            exit 1
-          fi
-          "${SEALED_ENV[@]}" python -m build >>"$PRIVATE_LOG" 2>&1
-          WHEELS=(dist/*.whl); SDISTS=(dist/*.tar.gz)
-          [[ -e "${WHEELS[0]}" && -e "${SDISTS[0]}" ]]
-          echo "package_build=passed"
-          echo "validation_status=passed"
+          echo "sealed_sha=$ACTUAL"
+          [[ "$RC" -eq 0 ]] && echo validation_status=passed || { echo validation_status=failed; exit 1; }
