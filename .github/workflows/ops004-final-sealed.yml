@@ -12,20 +12,6 @@ jobs:
     name: Validate sealed exact target
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    services:
-      postgres:
-        image: postgres:18.4
-        env:
-          POSTGRES_USER: ops004_ci
-          POSTGRES_PASSWORD: ops004_ci_ephemeral
-          POSTGRES_DB: ops004_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U ops004_ci -d ops004_ci"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Set up Python
         uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
@@ -37,7 +23,7 @@ jobs:
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: "60b56181ee8b419cca7d607c9a270955853bf1f4"
+          TARGET_SHA: "c978035eccba54598a35d6f44bf067c20ae0f0ed"
         run: |
           set -Eeuo pipefail
           umask 077
@@ -62,7 +48,14 @@ jobs:
           PRIVATE_LOG="$ROOT/private.log"
           JUNIT="$ROOT/results.xml"
           ASKPASS="$ROOT/askpass.sh"
-          cleanup() { chmod -R u+rwX "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"; }
+          PG_CONTAINER=""
+          cleanup() {
+            if [[ -n "${PG_CONTAINER:-}" ]]; then
+              docker rm -f "$PG_CONTAINER" >>"$PRIVATE_LOG" 2>&1 || true
+            fi
+            chmod -R u+rwX "$ROOT" 2>/dev/null || true
+            rm -rf "$ROOT"
+          }
           trap cleanup EXIT INT TERM
 
           cat > "$ASKPASS" <<'EOF'
@@ -114,11 +107,30 @@ jobs:
           HOME="$ROOT/installed-home" AI_CHEF_NO_BROWSER=1 "${SEALED_ENV[@]}" "$INSTALL_VENV/bin/ai-chef-runtime" --check >>"$PRIVATE_LOG" 2>&1
 
           PG_USER="ops004_ci"
-          PG_PASSWORD="ops004_ci_ephemeral"
-          PG_PORT="5432"
+          PG_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
           PG_DB="ops004_ci"
-          printf -v PG_URL 'postgresql://%s:%s@127.0.0.1:%s/%s' "$PG_USER" "$PG_PASSWORD" "$PG_PORT" "$PG_DB"
           printf '::add-mask::%s\n' "$PG_PASSWORD"
+          PG_CONTAINER="ops004-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker pull postgres:18.4 >>"$PRIVATE_LOG" 2>&1
+          docker run -d --rm --name "$PG_CONTAINER" \
+            -e POSTGRES_USER="$PG_USER" \
+            -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+            -e POSTGRES_DB="$PG_DB" \
+            -p 127.0.0.1::5432 \
+            postgres:18.4 >>"$PRIVATE_LOG" 2>&1
+          READY=0
+          for _ in $(seq 1 40); do
+            if docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >>"$PRIVATE_LOG" 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          [[ "$READY" -eq 1 ]]
+          PORT_MAPPING="$(docker port "$PG_CONTAINER" 5432/tcp)"
+          PG_PORT="${PORT_MAPPING##*:}"
+          [[ "$PG_PORT" =~ ^[0-9]+$ ]]
+          printf -v PG_URL 'postgresql://%s:%s@127.0.0.1:%s/%s' "$PG_USER" "$PG_PASSWORD" "$PG_PORT" "$PG_DB"
           printf '::add-mask::%s\n' "$PG_URL"
 
           cd "$SRC"
