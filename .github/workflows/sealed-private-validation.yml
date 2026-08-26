@@ -24,7 +24,7 @@ jobs:
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: "ee9f64d9ad7f9a3355e2a95921a3974989e3eae5"
+          TARGET_SHA: "4f7bfdb3d36c23a01ae968e45f22bb3d0d450835"
         run: |
           set -Eeuo pipefail
           umask 077
@@ -38,7 +38,6 @@ jobs:
           TARGET_REPOSITORY="$(printf '%s' "$REPOSITORY_META" | python -c 'import json,sys; data=json.load(sys.stdin); assert data.get("private") is True; print(data["full_name"])')"
           printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
           unset REPOSITORY_META TARGET_REPOSITORY_ID
-
           ROOT="$(mktemp -d)"
           SRC="$ROOT/source"
           PRIVATE_LOG="$ROOT/private.log"
@@ -46,7 +45,6 @@ jobs:
           ASKPASS="$ROOT/askpass.sh"
           cleanup() { chmod -R u+rwX "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"; }
           trap cleanup EXIT INT TERM
-
           cat > "$ASKPASS" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in
@@ -67,7 +65,6 @@ jobs:
           unset TARGET_TOKEN GIT_ASKPASS TARGET_REPOSITORY TARGET_SHA
           rm -f "$ASKPASS"
           git -C "$SRC" remote remove origin >>"$PRIVATE_LOG" 2>&1 || true
-
           SEALED_ENV=(env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_CACHE_URL -u ACTIONS_RESULTS_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL)
           cd "$SRC"
           "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
