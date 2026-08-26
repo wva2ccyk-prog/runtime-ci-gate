@@ -1,4 +1,4 @@
-name: OPS004 Sealed Regression Validation
+name: OPS004 Sealed Repository Validation
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
         env:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
-          TARGET_SHA: "ff565a8802efe95df417007877576216c4682a0c"
+          TARGET_SHA: "c978035eccba54598a35d6f44bf067c20ae0f0ed"
         run: |
           set -Eeuo pipefail
           umask 077
