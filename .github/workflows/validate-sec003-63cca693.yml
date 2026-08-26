@@ -104,10 +104,16 @@ jobs:
           "${SEALED_ENV[@]}" python -m pytest -q tests/test_phase5_api_deployment.py --tb=no --disable-warnings --timeout=60 >>"$PRIVATE_LOG" 2>&1
           echo "request_boundary_deployment=passed"
 
-          "${SEALED_ENV[@]}" python -m pytest -q tests -k 'database or postgres or sqlite' --tb=no --disable-warnings --timeout=60 >>"$PRIVATE_LOG" 2>&1
+          DB_TESTS="$ROOT/db-tests.txt"
+          grep -lE 'from core import database_config|import core\.database_config' tests/test_*.py >"$DB_TESTS" || true
+          [[ -s "$DB_TESTS" ]]
+          "${SEALED_ENV[@]}" python -m pytest -q $(cat "$DB_TESTS") --tb=no --disable-warnings --timeout=60 >>"$PRIVATE_LOG" 2>&1
           echo "database_config=passed"
 
-          "${SEALED_ENV[@]}" python -m pytest -q tests -k 'startup or launcher or runtime_config or run_server' --tb=no --disable-warnings --timeout=60 >>"$PRIVATE_LOG" 2>&1
+          STARTUP_TESTS="$ROOT/startup-tests.txt"
+          grep -lE 'from core import run_server|import core\.run_server|runtime_config' tests/test_*.py >"$STARTUP_TESTS" || true
+          [[ -s "$STARTUP_TESTS" ]]
+          "${SEALED_ENV[@]}" python -m pytest -q $(cat "$STARTUP_TESTS") --tb=no --disable-warnings --timeout=60 >>"$PRIVATE_LOG" 2>&1
           echo "startup_launcher=passed"
 
           "${SEALED_ENV[@]}" python -m pytest -q tests/test_secret_store.py tests/test_settings_secret_encryption.py --tb=no --disable-warnings --timeout=60 >>"$PRIVATE_LOG" 2>&1
