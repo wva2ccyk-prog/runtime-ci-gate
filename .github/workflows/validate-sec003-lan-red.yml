@@ -1,0 +1,118 @@
+name: SEC-003 LAN RED Witness
+
+on:
+  push:
+    branches:
+      - validate-sec003-lan-red-2eb3992
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: "3.11"
+
+      - name: Witness expected LAN regression failures
+        shell: bash
+        env:
+          TARGET_REPOSITORY_ID: "1317466526"
+          TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
+          TARGET_SHA: "8e1affe0a8ec3a38a9235aac07f39f6e0655547a"
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+          if [[ -z "$TARGET_TOKEN" || ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "red_status=configuration_error"
+            exit 1
+          fi
+
+          REPOSITORY_META="$(curl -fsS \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${TARGET_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
+          TARGET_REPOSITORY="$(printf '%s' "$REPOSITORY_META" | python -c 'import json,sys; data=json.load(sys.stdin); assert data.get("private") is True; print(data["full_name"])')"
+          printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
+          unset REPOSITORY_META TARGET_REPOSITORY_ID
+
+          ROOT="$(mktemp -d)"
+          SRC="$ROOT/source"
+          PRIVATE_LOG="$ROOT/private.log"
+          JUNIT="$ROOT/results.xml"
+          ASKPASS="$ROOT/askpass.sh"
+          cleanup() {
+            chmod -R u+rwX "$ROOT" 2>/dev/null || true
+            rm -rf "$ROOT"
+          }
+          trap cleanup EXIT INT TERM
+
+          cat > "$ASKPASS" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$TARGET_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS"
+          export GIT_TERMINAL_PROMPT=0
+
+          git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1
+          git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$PRIVATE_LOG" 2>&1
+          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$PRIVATE_LOG" 2>&1
+          git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$PRIVATE_LOG" 2>&1
+          ACTUAL_SHA="$(git -C "$SRC" rev-parse HEAD 2>>"$PRIVATE_LOG")"
+          if [[ "$ACTUAL_SHA" != "$TARGET_SHA" ]]; then
+            echo "red_status=checkout_mismatch"
+            exit 1
+          fi
+
+          unset TARGET_TOKEN GIT_ASKPASS TARGET_REPOSITORY
+          rm -f "$ASKPASS"
+          SEALED_ENV=(env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_CACHE_URL -u ACTIONS_RESULTS_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL)
+
+          cd "$SRC"
+          "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1
+
+          set +e
+          "${SEALED_ENV[@]}" python -m pytest -q --tb=no --disable-warnings --timeout=60 \
+            tests/test_sec003_startup_safety.py::test_lan_unlisted_private_ip_host_is_rejected \
+            tests/test_sec003_startup_safety.py::test_lan_unlisted_local_hostname_is_rejected \
+            tests/test_sec003_startup_safety.py::test_lan_explicitly_allowed_host_is_accepted \
+            tests/test_sec003_startup_safety.py::test_supported_single_worker_lan_succeeds_when_declared \
+            tests/test_sec003_startup_safety.py::test_desktop_host_boundary_is_unchanged \
+            tests/test_phase5_api_deployment.py::test_lan_request_host_boundary_matches_startup_allowlist \
+            tests/test_phase5_api_deployment.py::test_profile_compatibility_defaults \
+            -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
+          PYTEST_STATUS=$?
+          set -e
+
+          JUNIT_PATH="$JUNIT" PYTEST_STATUS="$PYTEST_STATUS" python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          def total(name): return sum(int(s.attrib.get(name, "0")) for s in suites)
+          observed = {
+              "tests": total("tests"),
+              "failures": total("failures"),
+              "errors": total("errors"),
+              "skipped": total("skipped"),
+          }
+          status = int(os.environ["PYTEST_STATUS"])
+          print(
+              f"red_tests={observed['tests']} failures={observed['failures']} "
+              f"errors={observed['errors']} skipped={observed['skipped']}"
+          )
+          if status == 0 or observed != {"tests": 7, "failures": 4, "errors": 0, "skipped": 0}:
+              sys.exit(1)
+          PY
+          echo "red_status=observed_expected_failure"
