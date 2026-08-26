@@ -74,7 +74,9 @@ jobs:
           root = ET.parse(os.environ["JUNIT_PATH"]).getroot()
           failures = []
           for case in root.iter("testcase"):
-              node = case.find("failure") or case.find("error")
+              failure = case.find("failure")
+              error = case.find("error")
+              node = failure if failure is not None else error
               if node is not None:
                   failures.append({
                       "classname": case.attrib.get("classname", ""),
