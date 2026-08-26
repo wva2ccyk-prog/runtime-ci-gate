@@ -136,6 +136,7 @@ jobs:
           cd "$SRC"
           set +e
           AI_CHEF_TEST_POSTGRES_URL="$PG_URL" \
+          AI_CHEF_POSTGRES_INTEGRATION=1 \
           AI_CHEF_TEST_INSTALLED_BIN_DIR="$INSTALL_VENV/bin" \
           "${SEALED_ENV[@]}" "$SRC_PY" -m pytest -q --tb=no --disable-warnings --timeout=60 \
             -o junit_family=legacy --junitxml="$JUNIT" >"$PRIVATE_LOG" 2>&1
