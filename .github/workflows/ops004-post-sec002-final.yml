@@ -46,33 +46,50 @@ jobs:
           RC=$?
           set -e
           SRC="$SRC" XML="$ROOT/full.xml" RC="$RC" python - <<'PY'
-          import os,subprocess,xml.etree.ElementTree as ET
+          import ast, os, re, subprocess, xml.etree.ElementTree as ET
+          src=os.environ['SRC']
           root=ET.parse(os.environ['XML']).getroot()
           suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
           total=lambda k:sum(int(s.attrib.get(k,'0')) for s in suites)
           print(f"clean_full_diagnostic tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
-          failures=[]
+          found=[]
           for case in root.iter('testcase'):
               node=case.find('failure')
-              if node is None:
-                  node=case.find('error')
-              if node is None:
-                  continue
-              path=case.attrib.get('file') or ''
-              blob='unmapped'
-              if path:
+              if node is None: node=case.find('error')
+              if node is None: continue
+              classname=case.attrib.get('classname') or ''
+              testname=(case.attrib.get('name') or '').split('[',1)[0]
+              parts=classname.split('.') if classname else []
+              path=None
+              for i in range(len(parts),0,-1):
+                  candidate='/'.join(parts[:i])+'.py'
                   try:
-                      blob=subprocess.check_output(['git','-C',os.environ['SRC'],'rev-parse',f'HEAD:{path}'],text=True,stderr=subprocess.DEVNULL).strip()
-                  except Exception:
-                      pass
-              typ=(node.attrib.get('type') or 'unknown').rsplit('.',1)[-1]
-              line=case.attrib.get('line') or 'unknown'
-              failures.append((blob,typ,line))
-          for i,(blob,typ,line) in enumerate(failures,1):
-              print(f"failure_{i}=blob:{blob} class:{typ} definition:{line}")
-          if len(failures) != total('failures') + total('errors'):
-              print("failure_mapping=INCOMPLETE")
-              raise SystemExit(2)
+                      subprocess.check_call(['git','-C',src,'cat-file','-e',f'HEAD:{candidate}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      path=candidate; break
+                  except subprocess.CalledProcessError: pass
+              if path is None and testname:
+                  hits=[]
+                  for p in subprocess.check_output(['git','-C',src,'ls-files','tests/*.py'],text=True).splitlines():
+                      try: text=open(os.path.join(src,p),encoding='utf-8').read()
+                      except Exception: continue
+                      if re.search(r'^\s*(?:async\s+)?def\s+'+re.escape(testname)+r'\s*\(',text,re.M): hits.append(p)
+                  if len(hits)==1: path=hits[0]
+              blob='unmapped'; line='unknown'
+              if path:
+                  blob=subprocess.check_output(['git','-C',src,'rev-parse',f'HEAD:{path}'],text=True).strip()
+                  try:
+                      tree=ast.parse(open(os.path.join(src,path),encoding='utf-8').read())
+                      for n in ast.walk(tree):
+                          if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==testname:
+                              line=str(min([n.lineno]+[d.lineno for d in n.decorator_list])); break
+                  except Exception: pass
+              raw=(node.attrib.get('type') or '')+' '+(node.text or '')
+              m=re.search(r'\b([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b',raw)
+              typ=(m.group(1).rsplit('.',1)[-1] if m else 'unknown')
+              found.append((blob,typ,line))
+          for i,(blob,typ,line) in enumerate(found,1): print(f"failure_{i}=blob:{blob} class:{typ} definition:{line}")
+          if len(found)!=total('failures')+total('errors') or any(x[0]=='unmapped' for x in found):
+              print('failure_mapping=INCOMPLETE'); raise SystemExit(2)
           PY
           echo "sealed_exact_sha=$TARGET_SHA"
           echo "private_leak=NO"
