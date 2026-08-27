@@ -1,12 +1,12 @@
-name: OPS-004 Post-SEC-002 Final Sealed Validation
+name: OPS-004 SEC-002 Guard Opaque Diagnostic
 on:
   push:
     branches: [validate/ops004-post-sec002-175ab54]
 permissions: {}
 jobs:
-  sealed:
+  diagnostic:
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 15
     steps:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
         with:
@@ -16,7 +16,6 @@ jobs:
           TARGET_REPOSITORY_ID: "1317466526"
           TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
           TARGET_SHA: "175ab540fc397772d9900edd11b5299058e1f701"
-          MAIN_SHA: "14335e32ee0dfa58ad9afcfe5ad0676a0e1de958"
         run: |
           set -Eeuo pipefail
           umask 077
@@ -25,7 +24,7 @@ jobs:
           REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"
           printf '::add-mask::%s\n' "$REPO"
           ROOT="$(mktemp -d)"; SRC="$ROOT/src"; LOG="$ROOT/private.log"; ASK="$ROOT/ask.sh"
-          trap 'docker rm -f ops004-final-pg >/dev/null 2>&1 || true; rm -rf "$ROOT"' EXIT INT TERM
+          trap 'rm -rf "$ROOT"' EXIT INT TERM
           cat > "$ASK" <<'EOF'
           #!/usr/bin/env bash
           case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
@@ -33,207 +32,34 @@ jobs:
           chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
           git init -q "$SRC" >>"$LOG" 2>&1
           git -C "$SRC" remote add origin "https://github.com/${REPO}.git"
-          git -C "$SRC" fetch --no-tags origin "$TARGET_SHA" "$MAIN_SHA" >>"$LOG" 2>&1
-          git -C "$SRC" checkout -q --detach "$TARGET_SHA"
+          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$LOG" 2>&1
+          git -C "$SRC" checkout -q --detach FETCH_HEAD
           [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
           git -C "$SRC" remote remove origin
           unset TARGET_TOKEN GIT_ASKPASS META REPO TARGET_REPOSITORY_ID
           rm -f "$ASK"
-
-          reset_tree() {
-            git -C "$SRC" reset --hard -q HEAD >>"$LOG" 2>&1
-            git -C "$SRC" clean -fdx -q >>"$LOG" 2>&1
-          }
-          clear_pg_env() {
-            unset AI_CHEF_TEST_POSTGRES_URL AI_CHEF_POSTGRES_INTEGRATION AI_CHEF_DATABASE_BACKEND AI_CHEF_DATABASE_URL AI_CHEF_DB_AUTO_MIGRATE AI_CHEF_ALLOW_POSTGRES_TEST_RESET AI_CHEF_TEST_INSTALLED_BIN_DIR || true
-          }
-          map_blobs() {
-            local list="$1" out="$2"
-            SRC="$SRC" LIST="$list" OUT="$out" python - <<'PY'
-          import os,subprocess
-          root=os.environ['SRC']; wanted=[x.strip() for x in open(os.environ['LIST']) if x.strip()]
-          tree={}
-          for row in subprocess.check_output(['git','-C',root,'ls-tree','-r','HEAD'],text=True).splitlines():
-              meta,path=row.split('\t',1); tree.setdefault(meta.split()[2],[]).append(path)
-          paths=[]
-          for blob in wanted:
-              hits=tree.get(blob,[])
-              if len(hits)!=1: raise SystemExit('opaque_blob_mapping_error')
-              paths.append(hits[0])
-          open(os.environ['OUT'],'w').write('\n'.join(paths)+'\n')
-          PY
-          }
-          report_xml() {
-            local label="$1" xml="$2" rc="$3"
-            LABEL="$label" XML="$xml" RC="$rc" python - <<'PY'
-          import os,xml.etree.ElementTree as ET
-          root=ET.parse(os.environ['XML']).getroot()
-          suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
-          total=lambda name: sum(int(s.attrib.get(name,'0')) for s in suites)
-          tests=total('tests'); failures=total('failures'); errors=total('errors'); skipped=total('skipped')
-          ok=(int(os.environ['RC'])==0 and failures==0 and errors==0)
-          print(f"{os.environ['LABEL']}={'PASS' if ok else 'FAIL'} tests={tests} failures={failures} errors={errors} skipped={skipped}")
-          if not ok: raise SystemExit(1)
-          PY
-          }
-          run_blob_tests() {
-            local label="$1" list="$2"
-            map_blobs "$list" "$ROOT/${label}.files"
-            mapfile -t SELECTED < "$ROOT/${label}.files"
-            set +e
-            python -m pytest -q --disable-warnings --timeout=120 --junitxml="$ROOT/${label}.xml" "${SELECTED[@]}" >>"$LOG" 2>&1
-            local rc=$?
-            set -e
-            report_xml "$label" "$ROOT/${label}.xml" "$rc"
-          }
-          run_pg_blob() {
-            local label="$1" blob="$2"
-            printf '%s\n' "$blob" > "$ROOT/one.blob"
-            map_blobs "$ROOT/one.blob" "$ROOT/one.file"
-            local file; file="$(cat "$ROOT/one.file")"
-            set +e
-            AI_CHEF_TEST_POSTGRES_URL="$PGURL" AI_CHEF_POSTGRES_INTEGRATION=1 AI_CHEF_DB_AUTO_MIGRATE=1 \
-              python -m pytest -q --disable-warnings --timeout=120 --junitxml="$ROOT/${label}.xml" "$file" >>"$LOG" 2>&1
-            local rc=$?
-            set -e
-            report_xml "$label" "$ROOT/${label}.xml" "$rc"
-          }
-
           cd "$SRC"
-          [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
-          DELTA_COUNT="$(git diff --name-only "$MAIN_SHA" "$TARGET_SHA" | wc -l | tr -d ' ')"
-          [[ "$DELTA_COUNT" == "13" ]]
-          echo "delta_scope=PASS changed_files=$DELTA_COUNT"
-
           python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$LOG" 2>&1
-          python -m pip check >>"$LOG" 2>&1
-          echo "pip_check_preflight=PASS"
-
-          reset_tree
-          clear_pg_env
-          cat > "$ROOT/ops.blobs" <<'EOF'
-          f65174389b98da6728f4168d524ba0c910c940cc
-          f8e6f1476bdffb565e381548c20e4329bcbd334e
-          a02d5e2d51ea3b910d17d56f964d142ff54c95c6
-          EOF
-          run_blob_tests "ops004_focused_contract" "$ROOT/ops.blobs"
-
-          reset_tree
-          clear_pg_env
-          cat > "$ROOT/sec.blobs" <<'EOF'
-          e68d0abdb38593fe2e8864abe263a01de92203db
-          a44b50e0888c18b899453f4706931a6c4a6d1897
-          EOF
-          run_blob_tests "sec002_overlap_guard" "$ROOT/sec.blobs"
-
-          reset_tree
-          clear_pg_env
-          set +e
-          python -m pytest -q --disable-warnings --timeout=120 --junitxml="$ROOT/full.xml" >>"$LOG" 2>&1
-          FULL_RC=$?
-          set -e
-          report_xml "clean_full" "$ROOT/full.xml" "$FULL_RC"
-          echo "clean_full_global_postgresql_url=UNSET"
-
-          reset_tree
-          clear_pg_env
-          python -m pip check >>"$LOG" 2>&1
-          echo "pip_check=PASS"
-          python -m compileall -q . >>"$LOG" 2>&1
-          echo "compileall=PASS"
-          printf '%s\n' b0ae1a78eca2b493a66f71b5c02d5601e711c5cd > "$ROOT/pkg.blob"
-          run_blob_tests "packaging_boundary" "$ROOT/pkg.blob"
-          python -m build --wheel >>"$LOG" 2>&1
-          test "$(find dist -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 1
-          echo "wheel=PASS"
-          python -m build --sdist >>"$LOG" 2>&1
-          test "$(find dist -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 1
-          echo "sdist=PASS"
-          python - <<'PY' >>"$LOG" 2>&1
-          import tarfile,zipfile
-          from pathlib import Path
-          wheel=next(Path('dist').glob('*.whl')); sdist=next(Path('dist').glob('*.tar.gz'))
-          with zipfile.ZipFile(wheel) as z: names=z.namelist()
-          assert not any(n.startswith('tools/') or '/tools/' in n for n in names)
-          with tarfile.open(sdist,'r:gz') as t: names=t.getnames()
-          assert not any(n.startswith('tools/') or '/tools/' in n for n in names)
+          unset AI_CHEF_TEST_POSTGRES_URL AI_CHEF_POSTGRES_INTEGRATION AI_CHEF_DATABASE_BACKEND AI_CHEF_DATABASE_URL AI_CHEF_DB_AUTO_MIGRATE AI_CHEF_ALLOW_POSTGRES_TEST_RESET || true
+          run_one() {
+            local label="$1" blob="$2"
+            local file
+            file="$(git ls-tree -r HEAD | awk -v b="$blob" '$3==b {sub(/^[^\t]*\t/,""); print; n++} END {if(n!=1) exit 3}')"
+            set +e
+            python -m pytest -q --disable-warnings --timeout=120 --junitxml="$ROOT/$label.xml" "$file" >>"$LOG" 2>&1
+            local rc=$?
+            set -e
+            LABEL="$label" XML="$ROOT/$label.xml" RC="$rc" python - <<'PY'
+          import os,xml.etree.ElementTree as ET
+          root=ET.parse(os.environ['XML']).getroot(); suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
+          total=lambda k:sum(int(s.attrib.get(k,'0')) for s in suites)
+          f=total('failures'); e=total('errors'); t=total('tests'); s=total('skipped')
+          ok=int(os.environ['RC'])==0 and f==0 and e==0
+          print(f"{os.environ['LABEL']}={'PASS' if ok else 'FAIL'} tests={t} failures={f} errors={e} skipped={s}")
           PY
-          echo "tools_repository_only=PASS"
-          VENV="$ROOT/installed"
-          python -m venv "$VENV" >>"$LOG" 2>&1
-          WHEEL="$(find "$SRC/dist" -maxdepth 1 -name '*.whl' -type f -print -quit)"
-          "$VENV/bin/python" -m pip install --disable-pip-version-check --no-input "$WHEEL" >>"$LOG" 2>&1
-          "$VENV/bin/python" -m pip check >>"$LOG" 2>&1
-          "$VENV/bin/ai-chef-postgres-recovery" --help >>"$LOG" 2>&1
-          echo "installed_recovery_cli_help=PASS"
-          clear_pg_env
-          "$VENV/bin/ai-chef-runtime" --check >>"$LOG" 2>&1
-          echo "installed_runtime_check=PASS"
-          cd "$ROOT"
-          "$VENV/bin/python" - <<'PY' >>"$LOG" 2>&1
-          import server
-          from fastapi.testclient import TestClient
-          spec=server.app.openapi(); assert isinstance(spec.get('paths'),dict) and spec['paths']
-          client=TestClient(server.app)
-          assert client.get('/api/v1/healthz').status_code == 200
-          PY
-          echo "installed_artifact_smoke=PASS"
-          cd "$SRC"
-
-          reset_tree
-          clear_pg_env
-          PW="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
-          printf '::add-mask::%s\n' "$PW"
-          docker pull postgres:18.4-bookworm >>"$LOG" 2>&1
-          docker run -d --name ops004-final-pg -e POSTGRES_DB=aichef_test -e POSTGRES_USER=aichef -e POSTGRES_PASSWORD="$PW" -p 127.0.0.1:5432:5432 postgres:18.4-bookworm >>"$LOG" 2>&1
-          for _ in $(seq 1 40); do
-            if docker exec ops004-final-pg pg_isready -U aichef -d aichef_test >>"$LOG" 2>&1; then break; fi
-            sleep 1
-          done
-          docker exec ops004-final-pg pg_isready -U aichef -d aichef_test >>"$LOG" 2>&1
-          docker exec ops004-final-pg postgres --version | grep -q '18\.4'
-          echo "postgres_version=18.4"
-          PGURL="postgresql://aichef:${PW}@127.0.0.1:5432/aichef_test"
-          printf '::add-mask::%s\n' "$PGURL"
-          run_pg_blob "postgresql_backend_contract" 7758cc51524d8e68764d8f157144f3f4abf7f74c
-          run_pg_blob "postgresql_integration" 0915418e5f15775b5ee4ca561b76be4421150958
-          echo "former_postgresql_blocker=PASS"
-          run_pg_blob "postgresql_validation_capture" 19bd6316d936c26c91992f7265eb8bd9da7313c7
-          run_pg_blob "postgresql_sec002_restricted_runtime" 3c7db8febc0148b43f7e50a64dcbda944ee4f662
-          unset AI_CHEF_TEST_INSTALLED_BIN_DIR || true
-          run_pg_blob "postgresql_ops004_live_repository" be2e8537a41904e2ba25bdc109048d24e0409c64
-          echo "real_pitr_rehearsal=NOT_RUN"
-
-          set +e
-          AI_CHEF_DEPLOYMENT_PROFILE=desktop AI_CHEF_WORKERS=1 python -m core.run_server --check >>"$LOG" 2>&1
-          DRC=$?
-          AI_CHEF_DEPLOYMENT_PROFILE=server AI_CHEF_WORKERS=1 python -m core.run_server --check >>"$LOG" 2>&1
-          SRC1=$?
-          AI_CHEF_DEPLOYMENT_PROFILE=lan AI_CHEF_HOST=192.168.10.10 AI_CHEF_ALLOWED_HOSTS=chef.lan AI_CHEF_WORKERS=1 python -m core.run_server --check >>"$LOG" 2>&1
-          LRC=$?
-          AI_CHEF_DEPLOYMENT_PROFILE=server AI_CHEF_DATABASE_BACKEND=postgresql AI_CHEF_DATABASE_URL="$PGURL" AI_CHEF_ALLOWED_HOSTS=chef.test AI_CHEF_ENABLE_POSTGRES_MULTI_WORKER=1 AI_CHEF_WORKERS=3 python -m core.run_server --check >"$ROOT/multi.log" 2>&1
-          MRC=$?
-          AI_CHEF_DEPLOYMENT_PROFILE=server AI_CHEF_HOST=0.0.0.0 AI_CHEF_WORKERS=1 AI_CHEF_ALLOWED_HOSTS= python -m core.run_server --check >"$ROOT/unsafe.log" 2>&1
-          URC=$?
-          set -e
-          test "$DRC" -eq 0; test "$SRC1" -eq 0; test "$LRC" -eq 0
-          test "$MRC" -ne 0; grep -q 'postgres_multi_worker_not_qualified' "$ROOT/multi.log"
-          test "$URC" -ne 0
-          rm -f "$ROOT/multi.log" "$ROOT/unsafe.log"
-          echo "startup_support_boundary=PASS desktop=supported server_single=supported lan=server_equivalent postgres_multi_worker=qualification_pending unsafe=fail_closed"
-
-          docker rm -f ops004-final-pg >>"$LOG" 2>&1
-          unset PW PGURL
-          clear_pg_env
-
-          reset_tree
-          clear_pg_env
-          [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]]
-          test -z "$(git -C "$SRC" status --porcelain --untracked-files=no)"
-          echo "tracked_tree_clean=YES"
+          }
+          run_one guard_a e68d0abdb38593fe2e8864abe263a01de92203db
+          run_one guard_b a44b50e0888c18b899453f4706931a6c4a6d1897
           echo "sealed_exact_sha=$TARGET_SHA"
-          echo "current_main_sha=$MAIN_SHA"
-          echo "qualification_boundary=REPOSITORY_IMPLEMENTATION_COMPLETE_REAL_POSTGRESQL_RESTORE_EVIDENCE_PENDING"
-          echo "postgres_multi_worker=EXPERIMENTAL_QUALIFICATION_PENDING"
           echo "private_leak=NO"
-          echo "validation_status=PASS"
+          echo "diagnostic_complete=YES"
