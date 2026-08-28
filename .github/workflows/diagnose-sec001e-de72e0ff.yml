@@ -78,8 +78,11 @@ jobs:
           )
           for TEST_FILE in "${TEST_FILES[@]}"; do
             XML="$ROOT/$(basename "$TEST_FILE").xml"
-            "${SEALED_ENV[@]}" python -m pytest -q "$TEST_FILE" --tb=no --disable-warnings --timeout=60 -o junit_family=legacy --junitxml="$XML" >>"$PRIVATE_LOG" 2>&1
-            RC=$?
+            if "${SEALED_ENV[@]}" python -m pytest -q "$TEST_FILE" --tb=no --disable-warnings --timeout=60 -o junit_family=legacy --junitxml="$XML" >>"$PRIVATE_LOG" 2>&1; then
+              RC=0
+            else
+              RC=$?
+            fi
             XML="$XML" TEST_FILE="$TEST_FILE" python - <<'PY'
           import os, xml.etree.ElementTree as ET
           path=os.environ['XML']; label=os.environ['TEST_FILE']
@@ -92,7 +95,9 @@ jobs:
               skipped=sum(int(s.attrib.get('skipped','0')) for s in suites)
               print(f"file={label} tests={tests} failures={failures} errors={errors} skipped={skipped}")
               for case in root.iter('testcase'):
-                  issue=case.find('failure') or case.find('error')
+                  issue=case.find('failure')
+                  if issue is None:
+                      issue=case.find('error')
                   if issue is not None:
                       name=case.attrib.get('name','unknown')
                       cls=case.attrib.get('classname','')
