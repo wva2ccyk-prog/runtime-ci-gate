@@ -1,0 +1,2 @@
+target=de72e0fffe883341774502b737083afa3524606f
+purpose=sealed SEC-001E test-file diagnostics
