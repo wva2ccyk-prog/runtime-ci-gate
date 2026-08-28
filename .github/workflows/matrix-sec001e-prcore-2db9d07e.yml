@@ -1,0 +1,51 @@
+name: SEC-001E PR Core Matrix 2db9d07e
+on:
+  push:
+    branches: [matrix-sec001e-prcore-2db9d07e]
+permissions: {}
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - tests/test_api_surface_compat.py
+          - tests/test_no_root_persistence.py
+          - tests/test_sec001j_startup_path.py
+          - tests/test_sec001j_static_runtime_state.py
+          - tests/test_sec001j_user_paths.py
+          - tests/test_security_boundaries.py
+          - tests/test_api_observability.py
+          - tests/test_p7_1d_acting_user.py
+          - tests/test_p7_user_isolation.py
+          - tests/test_privacy_export_owner_scope.py
+          - tests/test_state_recovery_privacy_lifecycle.py
+          - tests/test_support_grant_owner_boundary.py
+          - tests/test_csrf_cookie_auth.py
+          - tests/test_canonical_api_boundary.py
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: ${{ matrix.test }}
+    steps:
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: '3.11'
+      - shell: bash
+        env:
+          TARGET_REPOSITORY_ID: '1317466526'
+          TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
+          TARGET_SHA: 2db9d07edc98f5d721674b2e929badbaf379aa69
+          TEST_FILE: ${{ matrix.test }}
+        run: |
+          set -Eeuo pipefail; umask 077; printf '::add-mask::%s\n' "$TARGET_TOKEN"
+          META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
+          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"; printf '::add-mask::%s\n' "$REPO"
+          ROOT="$(mktemp -d)"; SRC="$ROOT/src"; ASK="$ROOT/a.sh"; trap 'rm -rf "$ROOT"' EXIT
+          cat > "$ASK" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
+          EOF
+          chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
+          git init -q "$SRC"; git -C "$SRC" remote add origin "https://github.com/${REPO}.git"; git -C "$SRC" fetch -q --depth=1 origin "$TARGET_SHA"; git -C "$SRC" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$TARGET_SHA"; unset TARGET_TOKEN GIT_ASKPASS REPO META
+          cd "$SRC"; python -m pip install --disable-pip-version-check --no-input '.[dev]' >/dev/null 2>&1; python -m pytest -q "$TEST_FILE" --tb=no --disable-warnings --timeout=90
