@@ -1,0 +1,61 @@
+name: SEC-001E PR Core Compatibility 2db9d07e
+
+on:
+  push:
+    branches:
+      - validate-sec001e-prcore-2db9d07e
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: "3.11"
+      - name: Run canonical PR-core plus SEC001E changed tests
+        shell: bash
+        env:
+          TARGET_REPOSITORY_ID: "1317466526"
+          TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
+          TARGET_SHA: "2db9d07edc98f5d721674b2e929badbaf379aa69"
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+          META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")"
+          REPO="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')"
+          printf '::add-mask::%s\n' "$REPO"
+          ROOT="$(mktemp -d)"; SRC="$ROOT/source"; LOG="$ROOT/private.log"; ASK="$ROOT/askpass.sh"
+          trap 'chmod -R u+rwX "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT INT TERM
+          cat > "$ASK" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in *Username*) echo x-access-token;; *Password*) echo "$TARGET_TOKEN";; *) exit 1;; esac
+          EOF
+          chmod 700 "$ASK"; export GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0
+          git init -q "$SRC" >>"$LOG" 2>&1
+          git -C "$SRC" remote add origin "https://github.com/${REPO}.git"
+          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$LOG" 2>&1
+          git -C "$SRC" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$TARGET_SHA"
+          echo "exact_sha=verified:$TARGET_SHA"
+          unset TARGET_TOKEN GIT_ASKPASS REPO META TARGET_REPOSITORY_ID
+          rm -f "$ASK"; git -C "$SRC" remote remove origin || true
+          cd "$SRC"
+          env -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN python -m pip install --disable-pip-version-check --no-input '.[dev]' >>"$LOG" 2>&1
+          python -m pip check >>"$LOG" 2>&1
+          python -m compileall -q server.py core api baking cooking data tests tools food cost coffee wine simulators >>"$LOG" 2>&1
+          for script in static/main.js static/ui-events.js static/lab-ui-events.js; do test ! -f "$script" || node --check "$script" >>"$LOG" 2>&1; done
+          mapfile -t TESTS < <(sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' tests/pr_core.txt)
+          TESTS+=(tests/test_sec001e_session_evidence.py tests/test_sec001e_session_evidence_edges.py tests/test_sec001e_session_evidence_postgres.py)
+          XML="$ROOT/prcore.xml"
+          python -m pytest -q --tb=no --disable-warnings --timeout=90 --timeout-method=thread "${TESTS[@]}" -o junit_family=legacy --junitxml="$XML" >>"$LOG" 2>&1
+          XML="$XML" python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          root=ET.parse(os.environ['XML']).getroot(); suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
+          total=lambda k: sum(int(s.attrib.get(k,'0')) for s in suites)
+          print(f"prcore_changed_tests={total('tests')} failures={total('failures')} errors={total('errors')} skipped={total('skipped')}")
+          PY
+          echo "compile_js_prcore_changed=passed"
