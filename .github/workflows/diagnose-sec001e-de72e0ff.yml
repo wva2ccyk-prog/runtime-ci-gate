@@ -1,0 +1,107 @@
+name: SEC-001E Diagnostic de72e0ff
+
+on:
+  push:
+    branches:
+      - validate-sec001e-de72e0ff
+
+permissions: {}
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: "3.11"
+
+      - name: Diagnose exact private SEC-001E head
+        shell: bash
+        env:
+          TARGET_REPOSITORY_ID: "1317466526"
+          TARGET_TOKEN: ${{ secrets.AI || secrets.PRIVATE_READ_TOKEN || secrets.PRIVATE_RUNTIME_READ_TOKEN }}
+          TARGET_SHA: "de72e0fffe883341774502b737083afa3524606f"
+        run: |
+          set -u
+          umask 077
+          printf '::add-mask::%s\n' "$TARGET_TOKEN"
+          if [[ -z "$TARGET_TOKEN" || ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "configuration_error"
+            exit 1
+          fi
+
+          META="$(curl -fsS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TARGET_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repositories/${TARGET_REPOSITORY_ID}")" || exit 1
+          TARGET_REPOSITORY="$(printf '%s' "$META" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("private") is True; print(d["full_name"])')" || exit 1
+          printf '::add-mask::%s\n' "$TARGET_REPOSITORY"
+          ROOT="$(mktemp -d)"
+          SRC="$ROOT/source"
+          PRIVATE_LOG="$ROOT/private.log"
+          ASKPASS="$ROOT/askpass.sh"
+          cleanup() { chmod -R u+rwX "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"; }
+          trap cleanup EXIT INT TERM
+          cat > "$ASKPASS" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$TARGET_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0
+          git init -q "$SRC" >>"$PRIVATE_LOG" 2>&1 || exit 1
+          git -C "$SRC" remote add origin "https://github.com/${TARGET_REPOSITORY}.git" >>"$PRIVATE_LOG" 2>&1 || exit 1
+          git -C "$SRC" fetch --no-tags --depth=1 origin "$TARGET_SHA" >>"$PRIVATE_LOG" 2>&1 || exit 1
+          git -C "$SRC" checkout --quiet --detach FETCH_HEAD >>"$PRIVATE_LOG" 2>&1 || exit 1
+          [[ "$(git -C "$SRC" rev-parse HEAD)" == "$TARGET_SHA" ]] || exit 1
+          echo "exact_sha=verified:$TARGET_SHA"
+          unset TARGET_TOKEN GIT_ASKPASS TARGET_REPOSITORY META TARGET_REPOSITORY_ID
+          rm -f "$ASKPASS"
+          git -C "$SRC" remote remove origin >>"$PRIVATE_LOG" 2>&1 || true
+          SEALED_ENV=(env -u GITHUB_ENV -u GITHUB_OUTPUT -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u GITHUB_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_RUNTIME_URL -u ACTIONS_CACHE_URL -u ACTIONS_RESULTS_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL)
+          cd "$SRC"
+          "${SEALED_ENV[@]}" python -m pip install --disable-pip-version-check --no-input ".[dev]" >>"$PRIVATE_LOG" 2>&1 || { echo "install=failed"; exit 1; }
+          "${SEALED_ENV[@]}" python -m pip check >>"$PRIVATE_LOG" 2>&1 || { echo "pip_check=failed"; exit 1; }
+          echo "install=passed"
+          "${SEALED_ENV[@]}" python -m compileall -q server.py core api scripts tests >>"$PRIVATE_LOG" 2>&1 || { echo "compileall=failed"; exit 1; }
+          echo "compileall=passed"
+
+          FAILED=0
+          TEST_FILES=(
+            tests/test_sec001e_session_evidence.py
+            tests/test_sec001e_session_evidence_edges.py
+            tests/test_privacy_export_owner_scope.py
+            tests/test_state_recovery_privacy_lifecycle.py
+            tests/test_p7_1d_acting_user.py
+          )
+          for TEST_FILE in "${TEST_FILES[@]}"; do
+            XML="$ROOT/$(basename "$TEST_FILE").xml"
+            "${SEALED_ENV[@]}" python -m pytest -q "$TEST_FILE" --tb=no --disable-warnings --timeout=60 -o junit_family=legacy --junitxml="$XML" >>"$PRIVATE_LOG" 2>&1
+            RC=$?
+            XML="$XML" TEST_FILE="$TEST_FILE" python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          path=os.environ['XML']; label=os.environ['TEST_FILE']
+          try:
+              root=ET.parse(path).getroot()
+              suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
+              tests=sum(int(s.attrib.get('tests','0')) for s in suites)
+              failures=sum(int(s.attrib.get('failures','0')) for s in suites)
+              errors=sum(int(s.attrib.get('errors','0')) for s in suites)
+              skipped=sum(int(s.attrib.get('skipped','0')) for s in suites)
+              print(f"file={label} tests={tests} failures={failures} errors={errors} skipped={skipped}")
+              for case in root.iter('testcase'):
+                  issue=case.find('failure') or case.find('error')
+                  if issue is not None:
+                      name=case.attrib.get('name','unknown')
+                      cls=case.attrib.get('classname','')
+                      msg=(issue.attrib.get('message') or '').replace('\n',' ')[:360]
+                      print(f"failed_case={cls}::{name} message={msg}")
+          except Exception as exc:
+              print(f"file={label} junit_parse_error={type(exc).__name__}")
+          PY
+            if [[ $RC -ne 0 ]]; then FAILED=1; fi
+          done
+          echo "diagnostic_failed=$FAILED"
+          exit "$FAILED"
